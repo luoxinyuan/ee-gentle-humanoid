@@ -539,7 +539,16 @@ from .utils import TemporalLerp, clamp_norm, create_mapping, rand_points_disk, r
 import os
 
 class MotionTrackingCommand_impedance(MotionTrackingCommand):
-    def __init__(self, env, *args, max_force: float = 30.0, net_force_limit: float = 30.0, net_torque_limit: float = 20.0, **kwargs):
+    def __init__(
+        self,
+        env,
+        *args,
+        max_force: float = 30.0,
+        compliance: bool = True,
+        net_force_limit: float = 30.0,
+        net_torque_limit: float = 20.0,
+        **kwargs,
+    ):
         super().__init__(env, *args, **kwargs)
 
         force_apply_pattern = [".*shoulder_yaw_link", ".*wrist_roll_link", ".*hand_mimic"]
@@ -555,6 +564,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.max_force = max_force
         self.net_force_limit  = torch.as_tensor(net_force_limit,  dtype=torch.float32, device=self.device)
         self.net_torque_limit = torch.as_tensor(net_torque_limit, dtype=torch.float32, device=self.device)
+        self.compliance = compliance
 
         # force origin samples
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -648,6 +658,13 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.torso_idx_motion = self.student_body_idx_motion[0].item()
             self.torso_idx_asset = self.student_body_idx_asset[0].item()
 
+            # baseline: random perturbation forces (non-compliant mode)
+            self.perturb_force = TemporalLerp(
+                shape=(self.num_envs, 2, 3),
+                device=self.device,
+                easing="linear",
+            )
+
         self.force_alpha = 1.0
 
         self.configure_admittance()
@@ -678,6 +695,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.force_origin_tl.reset(env_ids)
         self.force_kp_tl.reset(env_ids)
         self.force_kp_ramping_down[env_ids] = False
+        self.perturb_force.reset(env_ids, value=0.0)
         
         if refresh_time:
             self.force_sample_timer[env_ids] = random_uniform(env_ids.shape[0], 10, 60, self.device).int()
@@ -903,6 +921,37 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.force_expected_b[:] = force_expected_b
         self.force_expected_w[:] = quat_apply(root_quat_exp, force_expected_b)
 
+    # this function is for baseline (non-compliant perturbation)
+    def force_update_perturb_and_target(self):
+        self.force_sample_timer -= 1
+        time_done = self.force_sample_timer <= 0
+        need_resample = time_done.nonzero(as_tuple=False).squeeze(-1)
+        if need_resample.numel() > 0:
+            transit_time = random_uniform(need_resample.shape[0], 20, 50, self.device).int()
+            hold_time = random_uniform(need_resample.shape[0], 20, 100, self.device).int()
+            self.force_sample_timer[need_resample] = transit_time + hold_time
+
+            force = rand_points_isotropic(
+                need_resample.shape[0],
+                2,
+                r_max=float(self.max_force) * float(self.force_alpha),
+                device=self.device,
+            )  # [K, 2, 3]
+            force_enable = (torch.rand(need_resample.shape[0], 2, device=self.device) < 0.5).unsqueeze(-1)  # [K, 2, 1]
+            self.perturb_force.set(need_resample, end=force * force_enable, total_steps=transit_time)
+
+        # force target: track the reference keypoints (no admittance)
+        self.force_keypoint_w[:] = self.reward_keypoints_w[:, self.force_apply_idx_motion]
+
+        root_pos_w = self.asset.data.root_pos_w.unsqueeze(1)
+        root_quat_w = self.asset.data.root_quat_w.unsqueeze(1)
+        self.force_keypoint_b[:] = quat_apply_inverse(root_quat_w, self.force_keypoint_w - root_pos_w)
+
+        if self.last_reset_env_ids is not None:
+            self.force_keypoint_w_prev[self.last_reset_env_ids] = self.force_keypoint_w[self.last_reset_env_ids]
+        self.force_keypoint_vel_w[:] = (self.force_keypoint_w - self.force_keypoint_w_prev) / self.env.step_dt
+        self.force_keypoint_w_prev[:] = self.force_keypoint_w
+
     def project_pos_diff(self, pos_diff: torch.Tensor, force_dir: torch.Tensor):
         coef = (pos_diff * force_dir).sum(dim=-1, keepdim=True).clamp_max(0.0)
         return coef * force_dir
@@ -963,18 +1012,42 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.asset.has_external_wrench = False
         self.force_apply_world = True
 
+    # this function is for baseline (non-compliant perturbation)
+    def force_apply_perturb(self, substep: int):
+        quat_w = self.asset.data.body_quat_w[:, self.force_apply_idx_asset, :]
+        self.force_applied_w[:, -2:] = self.perturb_force.current  # [N, 2, 3]
+        self.force_applied_b[:] = quat_apply_inverse(
+            self.asset.data.root_quat_w.unsqueeze(1),
+            self.force_applied_w,
+        )
+        self.force_apply_buffer[:, self.force_apply_idx_asset, :] = self.force_applied_w
+
+        delta_w = quat_apply(quat_w, self.force_pos_delta)
+        self.torque_apply_buffer[:, self.force_apply_idx_asset, :] = torch.cross(delta_w, self.force_applied_w, dim=-1)
+
+        # override original force apply
+        self.asset.has_external_wrench = False
+        self.force_apply_world = True
+
     def before_update(self):
         super().before_update()
         self.update_reward_target()
-        self.force_kp_tl.update_time()
-        self.force_origin_tl.update_time()
-        self.force_safe_limit_tl.update_time()
-        self.force_schedule()
-        self.force_update_origin_and_target()
+        if self.compliance:
+            self.force_kp_tl.update_time()
+            self.force_origin_tl.update_time()
+            self.force_safe_limit_tl.update_time()
+            self.force_schedule()
+            self.force_update_origin_and_target()
+        else:
+            self.perturb_force.update_time()
+            self.force_update_perturb_and_target()
 
     def step(self, substep: int):
         super().step(substep)
-        self.force_apply(substep)
+        if self.compliance:
+            self.force_apply(substep)
+        elif self.max_force > 0.0:
+            self.force_apply_perturb(substep)
         self._limit_net_wrench_about_torso()
     
     def step_schedule(self, progress: float):

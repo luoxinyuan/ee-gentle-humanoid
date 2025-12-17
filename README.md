@@ -5,25 +5,35 @@
 [![Video](https://img.shields.io/badge/Video-Demo-FF0000.svg?logo=youtube)](https://www.youtube.com/watch?v=rF6N2o0IQJg)
 [![Online Demo](https://img.shields.io/badge/Online-Demo-3B82F6.svg?logo=demo)](https://gentle-humanoid.axell.top/#/demo)
 
-This is an official implementation of GentleHumanoid, more details please check our [Project](https://gentle-humanoid.axell.top) page. 
+This repository contains the official implementation of GentleHumanoid. For additional details, please refer to the [Project](https://gentle-humanoid.axell.top) page.
 
-This repo provides the codebase for training and evaluating GentleHumanoid policies. For deployment on real robots, please check [here](https://github.com/Axellwppr/gentle-humanoid/).
+Main features:
+
+*  A **universal** whole-body motion tracking policy,  training and evaluation pipeline.
+
+* Enabling training **with or without compliance**.
+
+* Dataset support including preprocessing for AMASS, Inter-X, and LAFAN.
+
+A **demo** of the pretrained policies, shows different force control settings, and a single model generalizing across diverse motions, is available [here](https://gentle-humanoid.axell.top/#/demo).
+
+Instructions for **real-robot deployment** and the use of **pretrained models** on new motion sequences are available [here](https://github.com/Axellwppr/gentle-humanoid/).
 
 ## Installation
 
 1. Create a Conda environment.
-```
+```bash
 conda create -n gentle python=3.10
 conda activate gentle
 ```
 
 2. Install Torch.
-```
+```bash
 pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 3. Install Isaac Sim. Support Ubuntu 22.04 only. For 20.04, please check [here](https://isaac-sim.github.io/IsaacLab/v2.1.0/source/setup/installation/binaries_installation.html).
-```
+```bash
 pip install 'isaacsim[all,extscache]==4.5.0' --extra-index-url https://pypi.nvidia.com
 # Test Isaacsim
 isaacsim
@@ -89,6 +99,14 @@ You can use the provided `train.sh` script to run the full training pipeline. Mo
 
 ```bash
 bash train.sh
+```
+
+By default, `train.sh` trains the GentleHumanoid policy (with compliance). If you want to train a baseline tracking policy (without compliance), please uncomment the corresponding lines in `train.sh`:
+
+```bash
+run_pipeline "G1/G1_gentle" "gt" "<date>" # by default, GentleHumanoid policy with compliance
+run_pipeline "G1/G1_no_force" "noforce" "<date>" # baseline tracking policy without force perturbation
+run_pipeline "G1/G1_extreme_force" "extremeforce" "<date>" # baseline tracking policy with force perturbation
 ```
 
 Under standard settings, training takes approximately 5 hours on 4× A100 GPUs.

@@ -1,0 +1,14 @@
+defaults:
+  # see https://hydra.cc/docs/advanced/overriding_packages/
+  - /task/G1/G1_gentle@_here_
+  - _self_
+name: G1EXTREMEFORCE
+
+command:
+  max_force: 30.0
+  compliance: False
+
+reward:
+  impedance:
+    force_reward: {enabled: false}
+    force_exd_penalty: {enabled: false}
