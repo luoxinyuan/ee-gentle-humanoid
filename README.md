@@ -1,7 +1,4 @@
-<h2 align="center">
-  <!-- <img src="docs/gentle_humanoid_logo.png" height="24" style="vertical-align: bottom; margin-right: 0px;" /> -->
-  <a href="https://gentle-humanoid.axell.top">GentleHumanoid: Learning Upper-body Compliance for Contact-rich Human and Object Interaction</a>
-</h2>
+# GentleHumanoid: Whole Body Motion Tracking with Compliance - Training
 
 [![Home Page](https://img.shields.io/badge/Project-Website-C27185.svg)](https://gentle-humanoid.axell.top/#/) 
 [![arXiv](https://img.shields.io/badge/Arxiv-2511.04679-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2511.04679) 
