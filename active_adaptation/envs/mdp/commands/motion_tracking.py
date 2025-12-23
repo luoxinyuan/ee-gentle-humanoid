@@ -28,6 +28,107 @@ from typing import Sequence
 from active_adaptation.envs.mdp.observations import random_noise
 from active_adaptation.envs.mdp.commands.admittance import AdmittanceMassChain
 
+import socket
+import struct
+import threading
+import time
+from typing import Optional, Tuple
+
+MAGIC = b"G6D1"
+PACK_FMT = "<4sI" + "f" * 28  # magic + seq + 28 floats
+PACK_SIZE = struct.calcsize(PACK_FMT)
+
+class UdpTeleopReceiver:
+    """
+    Receive UDP packets: root/head/left/right, each (pos3 + quat4) in WORLD frame.
+    Thread updates latest sample (CPU tensors).
+    """
+    def __init__(self, bind_ip="0.0.0.0", bind_port=15000, timeout=0.2):
+        self.bind_ip = bind_ip
+        self.bind_port = bind_port
+        self.timeout = timeout
+
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+        self._seq: int = -1
+        self._t_recv: float = 0.0
+
+        # store latest as torch CPU tensors
+        self._root_pos = torch.zeros(3, dtype=torch.float32)
+        self._root_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32)
+        self._head_pos = torch.zeros(3, dtype=torch.float32)
+        self._head_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32)
+        self._l_pos = torch.zeros(3, dtype=torch.float32)
+        self._l_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32)
+        self._r_pos = torch.zeros(3, dtype=torch.float32)
+        self._r_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((self.bind_ip, self.bind_port))
+        sock.settimeout(self.timeout)
+
+        while self._running:
+            try:
+                data, _ = sock.recvfrom(2048)
+                if len(data) != PACK_SIZE:
+                    continue
+                magic, seq, *floats = struct.unpack(PACK_FMT, data)
+                if magic != MAGIC:
+                    continue
+
+                # 4 bodies * 7 floats
+                vals = torch.tensor(floats, dtype=torch.float32)  # shape (28,)
+                root = vals[0:7]
+                head = vals[7:14]
+                left = vals[14:21]
+                right = vals[21:28]
+
+                with self._lock:
+                    self._seq = int(seq)
+                    self._t_recv = time.time()
+
+                    self._root_pos = root[0:3].clone()
+                    self._root_quat = root[3:7].clone()
+                    self._head_pos = head[0:3].clone()
+                    self._head_quat = head[3:7].clone()
+                    self._l_pos = left[0:3].clone()
+                    self._l_quat = left[3:7].clone()
+                    self._r_pos = right[0:3].clone()
+                    self._r_quat = right[3:7].clone()
+
+            except socket.timeout:
+                continue
+            except Exception:
+                continue
+
+    def get_latest(self) -> Tuple[int, float, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          seq, t_recv, root_pos(3), root_quat(4), head_pos(3), head_quat(4), l_pos(3), l_quat(4), r_pos(3), r_quat(4)
+        """
+        with self._lock:
+            return (
+                self._seq, self._t_recv,
+                self._root_pos.clone(), self._root_quat.clone(),
+                self._head_pos.clone(), self._head_quat.clone(),
+                self._l_pos.clone(), self._l_quat.clone(),
+                self._r_pos.clone(), self._r_quat.clone(),
+            )
+
+
 def _match_indices(motion_names, asset_names, patterns, name_map=None, device=None, debug=False):
     asset_idx, motion_idx = [], []
     for i, a in enumerate(asset_names):
@@ -134,6 +235,20 @@ class MotionTrackingCommand(Command):
             self.feet_patterns,
             device=self.device
         )
+
+        # bodies for teleoperation (head and wrists / hands) used for 6D teleop input
+        self.teleop_body_patterns = ["head_mimic", ".*_hand_mimic", ".*wrist_roll_link.*"]
+        self.teleop_idx_motion, self.teleop_idx_asset = _match_indices(
+            self.dataset.body_names,
+            self.asset.body_names,
+            self.teleop_body_patterns,
+            name_map=self.keypoint_map,
+            device=self.device,
+            debug=False,
+        )
+
+        self._teleop = UdpTeleopReceiver(bind_port=15000) 
+        self._teleop.start()
 
         # all joints except ankles
         self.ignore_joint_patterns = ignore_joint_patterns
@@ -326,6 +441,202 @@ class MotionTrackingCommand(Command):
         return self._motion.joint_pos.reshape(self.num_envs, -1)
     def target_joint_pos_obs_sym(self):
         return sym_utils.joint_space_symmetry(self.asset, self.dataset.joint_names).repeat(len(self.future_steps))
+
+    @observation
+    def root_and_wrist_6d(self):
+        """
+        Teleoperation observation: root world pos (3) + root orientation axis-angle (3) +
+        left/right wrist 6D poses (each 3 pos + 3 axis-angle) in ROOT frame.
+        
+        Output: [N, 18]
+        Order:
+          root_pos_w(3), left_wrist_pos_b(3), right_wrist_pos_b(3),
+          root_axis_angle(3), left_wrist_axis_angle_b(3), right_wrist_axis_angle_b(3)
+        
+        Note: root pos/ori are in WORLD frame, wrist pos/ori are in ROOT frame.
+        """
+        motion = self._motion
+
+        # --- Root pose in world frame ---
+        if not hasattr(motion, "root_pos_w") or not hasattr(motion, "root_quat_w"):
+            print("[WARNING] root_and_wrist_6d: motion missing root_pos_w or root_quat_w; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+        
+        root_pos_w = motion.root_pos_w[:, 0]      # [N, 3] world position
+        root_quat_w = motion.root_quat_w[:, 0]    # [N, 4] world quaternion
+        root_axis_ang = axis_angle_from_quat(root_quat_w)  # [N, 3]
+
+        # --- Wrist poses in root frame ---
+        has_local_pos = hasattr(motion, "local_body_pos")
+        has_local_rot = hasattr(motion, "local_body_rot")
+        
+        if has_local_pos:
+            pos_step = motion.local_body_pos[:, 0]   # [N, B, 3] root frame
+        elif hasattr(motion, "body_pos_b"):
+            pos_step = motion.body_pos_b[:, 0]       # [N, B, 3] root frame
+        else:
+            print("[WARNING] root_and_wrist_6d: motion missing body position data; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+
+        if has_local_rot:
+            rot_step = motion.local_body_rot[:, 0]   # [N, B, 4] root-relative
+        elif hasattr(motion, "body_quat_w"):
+            rot_w = motion.body_quat_w[:, 0]
+            root_quat_conj = quat_conjugate(root_quat_w).unsqueeze(1)
+            rot_step = quat_mul(root_quat_conj.expand(-1, rot_w.shape[1], -1), rot_w)
+        else:
+            print("[WARNING] root_and_wrist_6d: motion missing body rotation data; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+
+        # wrist body names (left and right only, no head)
+        wrist_names = ["left_hand_mimic", "right_hand_mimic"]
+        try:
+            wrist_idx = [self.dataset.body_names.index(n) for n in wrist_names]
+        except ValueError:
+            print("[WARNING] root_and_wrist_6d: expected wrist body names not found; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+
+        wrist_pos = pos_step[:, wrist_idx, :]   # [N, 2, 3]
+        wrist_rot = rot_step[:, wrist_idx, :]   # [N, 2, 4]
+        wrist_axis_ang = axis_angle_from_quat(wrist_rot)  # [N, 2, 3]
+
+        # Pack: root_pos(3), left_pos(3), right_pos(3), root_aa(3), left_aa(3), right_aa(3)
+        out = torch.cat([
+            root_pos_w,                                  # [N, 3]
+            wrist_pos.reshape(self.num_envs, -1),        # [N, 6]
+            root_axis_ang,                               # [N, 3]
+            wrist_axis_ang.reshape(self.num_envs, -1),   # [N, 6]
+        ], dim=-1)  # [N, 18]
+        
+        return out
+
+    def root_and_wrist_6d_sym(self):
+        """
+        Symmetry for root_and_wrist_6d:
+        - root pos/ori: flip y sign
+        - left/right wrist: swap and flip y sign
+        """
+        # Position symmetry: root(3) + left_wrist(3) + right_wrist(3) = 9
+        # root pos: [0,1,2] -> [0,1,2] with signs [1,-1,1]
+        # left/right swap: [3,4,5] <-> [6,7,8] with signs [1,-1,1]
+        pos_perm = torch.tensor([0, 1, 2, 6, 7, 8, 3, 4, 5])
+        pos_signs = torch.tensor([1., -1., 1., 1., -1., 1., 1., -1., 1.])
+        
+        # Orientation symmetry: root(3) + left_wrist(3) + right_wrist(3) = 9
+        # same pattern as position
+        ori_perm = torch.tensor([0, 1, 2, 6, 7, 8, 3, 4, 5]) + 9  # offset by 9
+        ori_signs = torch.tensor([-1., 1., -1., -1., 1., -1., -1., 1., -1.])
+        
+        perm = torch.cat([pos_perm, ori_perm])
+        signs = torch.cat([pos_signs, ori_signs])
+        
+        return sym_utils.SymmetryTransform(perm=perm, signs=signs)
+
+
+    @observation
+    def head_and_wrist_6d(self):
+        """
+        Teleoperation observation from motion data: for selected bodies (head, hand/wrist)
+        return 6D pose per body as position (3) + orientation as axis-angle (3),
+        both in ROOT frame.
+        
+        Uses `local_body_pos` and `local_body_rot` which are already root-relative.
+        """
+        motion = self._motion
+
+        # Check for required fields (local_body_pos and local_body_rot are root-relative)
+        has_local_pos = hasattr(motion, "local_body_pos")
+        has_local_rot = hasattr(motion, "local_body_rot")
+        
+        # Fallback to body_pos_b if local_body_pos not available
+        if has_local_pos:
+            pos_step = motion.local_body_pos[:, 0]   # [N, B, 3] -- already in root frame
+        elif hasattr(motion, "body_pos_b"):
+            pos_step = motion.body_pos_b[:, 0]       # [N, B, 3] -- also root frame
+        else:
+            print("[WARNING] head_and_wrist_6d: motion missing position data; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+
+        # For rotation: local_body_rot is already root-relative, no conversion needed!
+        if has_local_rot:
+            rot_step = motion.local_body_rot[:, 0]   # [N, B, 4] -- already root-relative
+        elif hasattr(motion, "body_quat_w"):
+            # Fallback: convert world quaternions to root-relative
+            rot_w = motion.body_quat_w[:, 0]         # [N, B, 4] world-frame
+            root_quat = motion.root_quat_w[:, 0]     # [N, 4]
+            root_quat_conj = quat_conjugate(root_quat).unsqueeze(1)  # [N, 1, 4]
+            rot_step = quat_mul(root_quat_conj.expand(-1, rot_w.shape[1], -1), rot_w)
+        else:
+            print("[WARNING] head_and_wrist_6d: motion missing rotation data; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+
+        # explicit names and their order (must match symmetry builder)
+        sel_names = ["head_mimic", "left_hand_mimic", "right_hand_mimic"]
+        try:
+            sel_idx = [self.dataset.body_names.index(n) for n in sel_names]
+        except ValueError:
+            print("[WARNING] head_and_wrist_6d: expected body names not found in dataset; returning zeros", flush=True)
+            return torch.zeros(self.num_envs, 18, device=self.device)
+
+        # select bodies
+        pos_sel = pos_step[:, sel_idx, :]   # [N, 3, 3]
+        rot_sel = rot_step[:, sel_idx, :]   # [N, 3, 4] root-relative quaternions
+
+        # axis-angle from quaternion (result [N, 3, 3])
+        axis_ang = axis_angle_from_quat(rot_sel)
+
+        out = torch.cat([pos_sel.reshape(self.num_envs, -1), axis_ang.reshape(self.num_envs, -1)], dim=-1)
+        return out
+    
+    # @observation
+    # def head_and_wrist_6d(self):
+    #     """
+    #     Teleoperation observation from UDP socket (already in ROOT frame).
+    #     Output: [N, 18]
+    #     Order:
+    #     head_pos(3), left_pos(3), right_pos(3),
+    #     head_axis_angle(3), left_axis_angle(3), right_axis_angle(3)
+    #     All in ROOT frame.
+    #     """
+    #     if not hasattr(self, "_teleop") or self._teleop is None:
+    #         return torch.zeros(self.num_envs, 18, device=self.device)
+
+    #     seq, t_recv, \
+    #         root_pos_unused, root_quat_unused, \
+    #         head_pos_b, head_quat_b, \
+    #         l_pos_b, l_quat_b, \
+    #         r_pos_b, r_quat_b = self._teleop.get_latest()
+
+    #     if seq < 0:
+    #         return torch.zeros(self.num_envs, 18, device=self.device)
+
+    #     # ---- pack positions (already root frame) ----
+    #     pos_sel_b = torch.stack([head_pos_b, l_pos_b, r_pos_b], dim=0).to(self.device)   # [3,3]
+    #     pos_sel_b = pos_sel_b.unsqueeze(0).expand(self.num_envs, -1, -1)                 # [N,3,3]
+
+    #     # ---- pack orientations (already root-relative) ----
+    #     quat_sel_b = torch.stack([head_quat_b, l_quat_b, r_quat_b], dim=0).to(self.device)  # [3,4]
+    #     # optional safety normalize
+    #     quat_sel_b = quat_sel_b / (torch.norm(quat_sel_b, dim=-1, keepdim=True) + 1e-8)
+    #     quat_sel_b = quat_sel_b.unsqueeze(0).expand(self.num_envs, -1, -1)               # [N,3,4]
+
+    #     axis_ang_b = axis_angle_from_quat(quat_sel_b)                                    # [N,3,3]
+
+    #     out = torch.cat(
+    #         [pos_sel_b.reshape(self.num_envs, -1),
+    #         axis_ang_b.reshape(self.num_envs, -1)],
+    #         dim=-1
+    #     )
+
+    #     # debug
+    #     # print(f"[DEBUG] seq={seq} out0={out[0].detach().cpu().tolist()}", flush=True)
+    #     return out
+
+    def head_and_wrist_6d_sym(self):
+        # build symmetry for the three selected bodies (head, left hand, right hand)
+        # Must match the order used in `head_and_wrist_6d` (head, left_hand, right_hand).
+        sel_names = ["head_mimic", "left_hand_mimic", "right_hand_mimic"]
+        return sym_utils.cartesian_space_symmetry(self.asset, sel_names, sign=[1, -1, 1]).repeat(2)
 
 
     @observation

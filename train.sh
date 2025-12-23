@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # ===== Global Configuration =====
-PROJECT="<YOUR_WANDB_ACCOUNT>/gentle_humanoid"
-NPROC=4
+PROJECT="luoxinyuan-duke-university/gentle_humanoid"
+
+export CUDA_VISIBLE_DEVICES=0
+NPROC=1
 SCRIPT="scripts/train.py"
 
 run_pipeline() {
@@ -37,6 +39,6 @@ run_pipeline() {
   echo ">>> ${cmd[*]}"; "${cmd[@]}"
 }
 
-run_pipeline "G1/G1_gentle" "gentle" "1215"
+run_pipeline "G1/G1_gentle" "gentle" "root_wrist"
 # run_pipeline "G1/G1_no_force" "noforce" "1215"
 # run_pipeline "G1/G1_extreme_force" "extremeforce" "1215"
