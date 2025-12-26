@@ -32,6 +32,7 @@ from torchrl.data import CompositeSpec
 
 OBS_KEY = "policy" # ("agents", "observation")
 OBS_PRIV_KEY = "priv"
+OBS_JOINT_KEY = "joint_target"  # Teacher-only: target joint positions
 CRITIC_PRIV_KEY = "priv_critic"
 OBS_HIST_KEY = "policy_h"
 ACTION_KEY = "action" # ("agents", "action")

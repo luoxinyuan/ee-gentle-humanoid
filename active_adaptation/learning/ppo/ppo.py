@@ -76,6 +76,7 @@ class PPOConfig:
         default_factory=lambda: [
             OBS_KEY,
             OBS_PRIV_KEY,
+            OBS_JOINT_KEY,
             CRITIC_PRIV_KEY
         ]
     )
@@ -140,7 +141,10 @@ class PPOPolicy(TensorDictModuleBase):
             ["priv_pred"],
         ).to(device)
         # ---------------------------------------------------------------------------- actor(s)
-        actor_in_keys_train = [OBS_KEY, "priv_feature"]
+        # Teacher: uses policy + joint_target (direct) + priv_feature (encoded)
+        # Student: uses policy + priv_pred (predicted latent, no joint_target)
+        # actor_in_keys_train = [OBS_KEY, "priv_feature"]
+        actor_in_keys_train = [OBS_KEY, OBS_JOINT_KEY, "priv_feature"]
         actor_in_keys_adapt = [OBS_KEY, "priv_pred"]
 
         def build_actor(in_keys):
@@ -212,11 +216,13 @@ class PPOPolicy(TensorDictModuleBase):
 
         self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transforms()
         self.obs_priv_transform = env.observation_funcs[OBS_PRIV_KEY].symmetry_transforms()
+        self.obs_joint_transform = env.observation_funcs[OBS_JOINT_KEY].symmetry_transforms()
         self.critic_priv_transform = env.observation_funcs[CRITIC_PRIV_KEY].symmetry_transforms()
         self.act_transform = env.action_manager.symmetry_transforms()
 
         self.obs_transform = self.obs_transform.to(self.device)
         self.obs_priv_transform = self.obs_priv_transform.to(self.device)
+        self.obs_joint_transform = self.obs_joint_transform.to(self.device)
         self.critic_priv_transform = self.critic_priv_transform.to(self.device)
         self.act_transform = self.act_transform.to(self.device)
 
@@ -342,6 +348,8 @@ class PPOPolicy(TensorDictModuleBase):
         mb_sym = mb.clone()
         mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
         mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
+        if OBS_JOINT_KEY in mb_sym.keys():
+            mb_sym[OBS_JOINT_KEY] = self.obs_joint_transform(mb_sym[OBS_JOINT_KEY])
         mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
         mb_sym["adv"] = mb["adv"]
         mb_sym["ret"] = mb["ret"]
@@ -440,6 +448,8 @@ class PPOPolicy(TensorDictModuleBase):
         mb_sym = mb.clone()
         mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
         mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
+        if OBS_JOINT_KEY in mb_sym.keys():
+            mb_sym[OBS_JOINT_KEY] = self.obs_joint_transform(mb_sym[OBS_JOINT_KEY])
         mb_sym[CRITIC_PRIV_KEY] = self.critic_priv_transform(mb_sym[CRITIC_PRIV_KEY])
         mb_sym["is_init"] = mb["is_init"]
 

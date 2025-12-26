@@ -82,8 +82,11 @@ observation:
 
     joint_pos_history:         {history_steps: [0, 1, 2, 3, 4, 8], noise_std: 0.005}
     prev_actions:   {steps: 3}
+  joint_target:
+    # Teacher-only: direct joint target input (not compressed through encoder)
+    target_joint_pos_obs: {}
   priv:
-    # tracking
+    # tracking (removed target_joint_pos_obs, now in joint_target)
     target_joint_pos_obs: {}
     target_pos_b_obs: {}
     target_linvel_b_obs: {}
