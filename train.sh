@@ -39,6 +39,6 @@ run_pipeline() {
   echo ">>> ${cmd[*]}"; "${cmd[@]}"
 }
 
-run_pipeline "G1/G1_gentle" "gentle" "root_wrist"
+run_pipeline "G1/G1_gentle" "gentle" "root_wrist_2"
 # run_pipeline "G1/G1_no_force" "noforce" "1215"
 # run_pipeline "G1/G1_extreme_force" "extremeforce" "1215"
