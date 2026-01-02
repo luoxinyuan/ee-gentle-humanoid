@@ -501,6 +501,10 @@ class MotionTrackingCommand(Command):
         wrist_rot = rot_step[:, wrist_idx, :]   # [N, 2, 4]
         wrist_axis_ang = axis_angle_from_quat(wrist_rot)  # [N, 2, 3]
 
+        # TEST: zero root command to see if robot stands still
+        # root_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        # root_axis_ang = torch.zeros(self.num_envs, 3, device=self.device)
+
         # Pack: root_pos(3), left_pos(3), right_pos(3), root_aa(3), left_aa(3), right_aa(3)
         out = torch.cat([
             root_pos_w,                                  # [N, 3]
