@@ -60,6 +60,8 @@ class PPOConfig:
     load_noise_scale: float | None = None  # initial std for student actor
 
     latent_dim: int = 256
+    # joint prediction weight for adapt-phase estimator
+    joint_pred_weight: float = 1.0
 
     # distillation
     reg_lambda: float = 0.2  # weight of priv-feature alignment
@@ -140,12 +142,25 @@ class PPOPolicy(TensorDictModuleBase):
             [OBS_KEY],
             ["priv_pred"],
         ).to(device)
+        # ---------------------------------------------------------------------------- joint predictor (student)
+        # predict a privileged joint observation (priv_joint) from OBS_KEY so that
+        # actor_student can consume it during adapt/finetune
+        # determine joint dim from fake_td
+        joint_dim = fake_td[OBS_JOINT_KEY].shape[-1]
+        self.adapt_joint_module = Mod(
+            nn.Sequential(
+                make_mlp([512, 256]),
+                nn.LazyLinear(joint_dim),
+            ),
+            [OBS_KEY],
+            ["priv_joint"],
+        ).to(device)
         # ---------------------------------------------------------------------------- actor(s)
         # Teacher: uses policy + joint_target (direct) + priv_feature (encoded)
         # Student: uses policy + priv_pred (predicted latent, no joint_target)
         # actor_in_keys_train = [OBS_KEY, "priv_feature"]
-        actor_in_keys_train = [OBS_KEY, OBS_JOINT_KEY, "priv_feature"]
-        actor_in_keys_adapt = [OBS_KEY, "priv_pred"]
+        actor_in_keys_train = [OBS_KEY, "priv_feature", OBS_JOINT_KEY]
+        actor_in_keys_adapt = [OBS_KEY, "priv_pred", "priv_joint"]
 
         def build_actor(in_keys):
             return ProbabilisticActor(
@@ -174,6 +189,7 @@ class PPOPolicy(TensorDictModuleBase):
             fake_td["is_init"] = torch.ones(fake_td.shape[0], 1, dtype=torch.bool)
         self.encoder_priv(fake_td)
         self.adapt_module(fake_td)
+        self.adapt_joint_module(fake_td)
         self.actor_teacher(fake_td)
         self.actor_student(fake_td)
         self.critic(fake_td)
@@ -207,12 +223,19 @@ class PPOPolicy(TensorDictModuleBase):
             ],
             lr=cfg.lr,
         )
+        self.opt_joint = torch.optim.Adam(self.adapt_joint_module.parameters(), lr=cfg.lr)
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
         self.opt_estimator = torch.optim.Adam(self.adapt_module.parameters(), lr=cfg.lr)
 
         self.update_teacher = functools.partial(self._update, actor=self.actor_teacher, encoder=self.encoder_priv, critic=self.critic, opt_actor=self.opt_teacher, opt_critic=self.opt_critic)
         self.update_student = functools.partial(self._update, actor=self.actor_student, encoder=self.adapt_module, critic=self.critic, opt_actor=self.opt_student, opt_critic=self.opt_critic)
-        self.update2 = functools.partial(self._update2, adapt_module=self.adapt_module, opt_estimator=self.opt_estimator)
+        self.update2 = functools.partial(
+            self._update2,
+            adapt_module=self.adapt_module,
+            adapt_joint_module=self.adapt_joint_module,
+            opt_estimator=self.opt_estimator,
+            opt_joint=self.opt_joint,
+        )
 
         self.obs_transform = env.observation_funcs[OBS_KEY].symmetry_transforms()
         self.obs_priv_transform = env.observation_funcs[OBS_PRIV_KEY].symmetry_transforms()
@@ -235,6 +258,7 @@ class PPOPolicy(TensorDictModuleBase):
         self.encoder_priv  = DDP(self.encoder_priv,  **ddp_kwargs)
         self.critic        = DDP(self.critic,        **ddp_kwargs)
         self.adapt_module  = DDP(self.adapt_module,  **ddp_kwargs)
+        self.adapt_joint_module = DDP(self.adapt_joint_module, **ddp_kwargs)
 
     def broadcast_parameters(self, extra_modules=[]):
         if self.num_updates % 32 == 0:
@@ -279,9 +303,11 @@ class PPOPolicy(TensorDictModuleBase):
             modules += [self.encoder_priv, self.actor_teacher]
         elif self.cfg.phase == "finetune":
             modules += [self.adapt_module]
+            modules += [self.adapt_joint_module]
             modules += [self.actor_student]
         elif self.cfg.phase == "adapt":
             modules += [self.adapt_module]
+            modules += [self.adapt_joint_module]
             modules += [self.actor_student]
 
         policy = Seq(*modules)
@@ -444,7 +470,7 @@ class PPOPolicy(TensorDictModuleBase):
 
         return {k: v.mean().item() for k, v in torch.stack(infos).items()}
 
-    def _update2(self, mb, adapt_module, opt_estimator):
+    def _update2(self, mb, adapt_module, adapt_joint_module, opt_estimator, opt_joint):
         mb_sym = mb.clone()
         mb_sym[OBS_KEY] = self.obs_transform(mb_sym[OBS_KEY])
         mb_sym[OBS_PRIV_KEY] = self.obs_priv_transform(mb_sym[OBS_PRIV_KEY])
@@ -459,16 +485,29 @@ class PPOPolicy(TensorDictModuleBase):
 
         with torch.no_grad():
             self.encoder_priv(mb)
+        # compute student predictions (with grad)
         adapt_module(mb)
+        adapt_joint_module(mb)
 
         valid = ~mb["is_init"]
-        loss = torch.mean(F.mse_loss(mb["priv_pred"], mb["priv_feature"], reduction="none") * (valid))
+        loss_pred = torch.mean(F.mse_loss(mb["priv_pred"], mb["priv_feature"], reduction="none") * (valid))
+
+        # joint prediction loss: only compute if joint key exists in batch
+        if OBS_JOINT_KEY in mb.keys():
+            joint_target = mb[OBS_JOINT_KEY]
+            loss_joint = torch.mean(F.mse_loss(mb["priv_joint"], joint_target, reduction="none") * (valid))
+        else:
+            loss_joint = torch.tensor(0.0, device=loss_pred.device)
+
+        loss = loss_pred + self.cfg.joint_pred_weight * loss_joint
 
         opt_estimator.zero_grad()
+        opt_joint.zero_grad()
         loss.backward()
         opt_estimator.step()
+        opt_joint.step()
 
-        return {"adapt/estimator_loss": loss.detach()}
+        return {"adapt/estimator_loss": loss_pred.detach(), "adapt/joint_loss": loss_joint.detach()}
 
     @staticmethod
     @torch.compile
@@ -584,15 +623,60 @@ class PPOPolicy(TensorDictModuleBase):
         src = src_module.module if isinstance(src_module, DDP) else src_module
         dst = dst_module.module if isinstance(dst_module, DDP) else dst_module
 
+        """Copy parameters from src -> dst.
+
+        Behavior:
+        - If parameter shapes match, perform blended copy: dst = tau*src + (1-tau)*dst
+        - If shapes differ, copy overlapping slices and leave the remainder of dst unchanged
+        - Also attempt to copy buffers (e.g. running stats) with the same rules
+
+        This makes it possible to transfer most weights even when teacher and student
+        receive different concatenated inputs (e.g. teacher includes joint obs).
+        """
         with torch.no_grad():
             src_params = dict(src.named_parameters())
-            for name, dst_param in dst.named_parameters():
-                if name in src_params:
-                    src_param = src_params[name]
-                    # The requires_grad status of dst_param is maintained
-                    dst_param.data.copy_(
-                        tau * src_param.data + (1.0 - tau) * dst_param.data
-                    )
+            dst_params = dict(dst.named_parameters())
+
+            for name, dst_param in dst_params.items():
+                if name not in src_params:
+                    continue
+                src_param = src_params[name]
+                s = src_param.data
+                d = dst_param.data
+
+                if s.shape == d.shape:
+                    d.copy_(tau * s + (1.0 - tau) * d)
+                else:
+                    # Partial copy for overlapping dimensions
+                    try:
+                        # Determine common shape along each axis
+                        common = tuple(min(a, b) for a, b in zip(s.shape, d.shape))
+                        src_slices = tuple(slice(0, c) for c in common)
+                        dst_slices = tuple(slice(0, c) for c in common)
+                        d[dst_slices].copy_(tau * s[src_slices] + (1.0 - tau) * d[dst_slices])
+                        warnings.warn(f"Partial param copy for '{name}': src {s.shape} -> dst {d.shape}")
+                    except Exception as e:
+                        warnings.warn(f"Failed partial copy for param '{name}': {e}")
+
+            # Copy buffers as well (e.g., running_mean/var). Handle shape mismatches similarly.
+            src_bufs = dict(src.named_buffers())
+            dst_bufs = dict(dst.named_buffers())
+            for name, dst_buf in dst_bufs.items():
+                if name not in src_bufs:
+                    continue
+                s = src_bufs[name].data
+                d = dst_buf.data
+                if s.shape == d.shape:
+                    d.copy_(s)
+                else:
+                    try:
+                        common = tuple(min(a, b) for a, b in zip(s.shape, d.shape))
+                        src_slices = tuple(slice(0, c) for c in common)
+                        dst_slices = tuple(slice(0, c) for c in common)
+                        d[dst_slices].copy_(s[src_slices])
+                        warnings.warn(f"Partial buffer copy for '{name}': src {s.shape} -> dst {d.shape}")
+                    except Exception as e:
+                        warnings.warn(f"Failed partial copy for buffer '{name}': {e}")
     
     @staticmethod
     def hard_copy_(src_module: nn.Module, dst_module: nn.Module):
