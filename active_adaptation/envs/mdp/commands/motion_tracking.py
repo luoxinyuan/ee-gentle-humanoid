@@ -1392,6 +1392,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_ramp_down_range: Sequence[int] = (25, 75),
         net_pull_rest_range: Sequence[int] = (50, 150),
         net_pull_xy_only: bool = True,
+        net_pull_zero_prob: float = 0.0,
         net_pull_ee_compliance_stiffness: float = 200.0,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
@@ -1578,6 +1579,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.net_pull_ramp_down_range = tuple(int(x) for x in net_pull_ramp_down_range)
         self.net_pull_rest_range = tuple(int(x) for x in net_pull_rest_range)
         self.net_pull_xy_only = net_pull_xy_only
+        self.net_pull_zero_prob = float(net_pull_zero_prob)
+        if not 0.0 <= self.net_pull_zero_prob <= 1.0:
+            raise ValueError(f"net_pull_zero_prob must be in [0, 1], got {self.net_pull_zero_prob}.")
         self.net_pull_ee_compliance_stiffness = float(net_pull_ee_compliance_stiffness)
         self.net_pull_ee_compliance_max_offset = float(net_pull_ee_compliance_max_offset)
         self.net_pull_ee_compliance_force_deadband = float(net_pull_ee_compliance_force_deadband)
@@ -1857,25 +1861,40 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
         rest_envs = env_ids[phase_at_done == 0]
         if rest_envs.numel() > 0:
-            self.net_pull_phase[rest_envs] = 1
-            self.net_pull_body_local_idx[rest_envs] = (
-                torch.rand(rest_envs.numel(), device=self.device) * self.net_pull_num_bodies
-            ).floor().long()
-            self.net_pull_force_dir_w[rest_envs] = self._sample_net_pull_direction(rest_envs.numel())
-            force_mag = random_uniform(
-                (rest_envs.numel(), 1),
-                self.net_pull_force_range[0],
-                self.net_pull_force_range[1],
-                self.device,
-            )
-            ramp_steps = random_uniform(
-                rest_envs.numel(),
-                self.net_pull_ramp_up_range[0],
-                self.net_pull_ramp_up_range[1],
-                self.device,
-            ).int()
-            self.net_pull_phase_timer[rest_envs] = ramp_steps
-            self.net_pull_force_tl.set(rest_envs, end=force_mag, total_steps=ramp_steps)
+            zero_pull = torch.rand(rest_envs.numel(), device=self.device) < self.net_pull_zero_prob
+            zero_envs = rest_envs[zero_pull]
+            if zero_envs.numel() > 0:
+                self.net_pull_phase[zero_envs] = 0
+                self.net_pull_force_dir_w[zero_envs] = 0.0
+                self.net_pull_force_tl.set(zero_envs, end=0.0, total_steps=1)
+                self.net_pull_phase_timer[zero_envs] = random_uniform(
+                    zero_envs.numel(),
+                    self.net_pull_rest_range[0],
+                    self.net_pull_rest_range[1],
+                    self.device,
+                ).int()
+
+            active_envs = rest_envs[~zero_pull]
+            if active_envs.numel() > 0:
+                self.net_pull_phase[active_envs] = 1
+                self.net_pull_body_local_idx[active_envs] = (
+                    torch.rand(active_envs.numel(), device=self.device) * self.net_pull_num_bodies
+                ).floor().long()
+                self.net_pull_force_dir_w[active_envs] = self._sample_net_pull_direction(active_envs.numel())
+                force_mag = random_uniform(
+                    (active_envs.numel(), 1),
+                    self.net_pull_force_range[0],
+                    self.net_pull_force_range[1],
+                    self.device,
+                )
+                ramp_steps = random_uniform(
+                    active_envs.numel(),
+                    self.net_pull_ramp_up_range[0],
+                    self.net_pull_ramp_up_range[1],
+                    self.device,
+                ).int()
+                self.net_pull_phase_timer[active_envs] = ramp_steps
+                self.net_pull_force_tl.set(active_envs, end=force_mag, total_steps=ramp_steps)
 
         ramp_up_envs = env_ids[phase_at_done == 1]
         if ramp_up_envs.numel() > 0:
