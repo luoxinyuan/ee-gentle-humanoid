@@ -1919,13 +1919,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             if zero_envs.numel() > 0:
                 self.net_pull_phase[zero_envs] = 0
                 self.net_pull_force_dir_w[zero_envs] = 0.0
-                self.net_pull_force_w[zero_envs] = 0.0
-                self.net_pull_force_b[zero_envs] = 0.0
-                self.net_pull_point_b[zero_envs] = 0.0
-                self.net_pull_force_tl.reset(
-                    zero_envs,
-                    value=torch.zeros(zero_envs.shape[0], 1, device=self.device),
-                )
+                self.net_pull_force_tl.set(zero_envs, end=0.0, total_steps=1)
                 self.net_pull_phase_timer[zero_envs] = random_uniform(
                     zero_envs.numel(),
                     self.net_pull_rest_range[0],
@@ -1981,13 +1975,6 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         if ramp_down_envs.numel() > 0:
             self.net_pull_phase[ramp_down_envs] = 0
             self.net_pull_force_dir_w[ramp_down_envs] = 0.0
-            self.net_pull_force_w[ramp_down_envs] = 0.0
-            self.net_pull_force_b[ramp_down_envs] = 0.0
-            self.net_pull_point_b[ramp_down_envs] = 0.0
-            self.net_pull_force_tl.reset(
-                ramp_down_envs,
-                value=torch.zeros(ramp_down_envs.shape[0], 1, device=self.device),
-            )
             self.net_pull_phase_timer[ramp_down_envs] = random_uniform(
                 ramp_down_envs.numel(),
                 self.net_pull_rest_range[0],
@@ -2007,11 +1994,6 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.asset.data.root_quat_w,
             point_w - self.asset.data.root_pos_w,
         )
-        inactive = self.net_pull_phase == 0
-        if inactive.any():
-            self.net_pull_force_w[inactive] = 0.0
-            self.net_pull_force_b[inactive] = 0.0
-            self.net_pull_point_b[inactive] = 0.0
     
     def force_schedule(self):
         # procedure:
@@ -2666,12 +2648,8 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     @observation
     def net_pull_force_priv(self):
-        active = self.net_pull_phase != 0
-
         body_one_hot = torch.zeros(self.num_envs, self.net_pull_num_bodies, device=self.device)
-        active_envs = active.nonzero(as_tuple=False).squeeze(-1)
-        if active_envs.numel() > 0:
-            body_one_hot[active_envs, self.net_pull_body_local_idx[active_envs]] = 1.0
+        body_one_hot.scatter_(1, self.net_pull_body_local_idx.unsqueeze(1), 1.0)
 
         phase_one_hot = torch.zeros(self.num_envs, 4, device=self.device)
         phase_idx = self.net_pull_phase.clamp(min=0, max=3).long()
@@ -2679,15 +2657,14 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
         timer = self.net_pull_phase_timer.clamp_min(0).float().unsqueeze(-1) / 250.0
         force_mag = self.net_pull_force_tl.current / max(self.net_pull_force_range[1], 1e-6)
-        active_f = active.float().unsqueeze(-1)
         return torch.cat([
-            self.net_pull_point_b * active_f,
-            (self.net_pull_force_b / max(self.net_pull_force_range[1], 1e-6)) * active_f,
-            (self.net_pull_force_w / max(self.net_pull_force_range[1], 1e-6)) * active_f,
+            self.net_pull_point_b,
+            self.net_pull_force_b / max(self.net_pull_force_range[1], 1e-6),
+            self.net_pull_force_w / max(self.net_pull_force_range[1], 1e-6),
             body_one_hot,
             phase_one_hot,
             timer,
-            force_mag * active_f,
+            force_mag,
         ], dim=-1)
 
     def net_pull_force_priv_sym(self):
