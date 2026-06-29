@@ -6,7 +6,11 @@ command:
   # Match the low-level legacy force sampling cadence more closely:
   # about 40% zero-force windows, active duration 20-200 steps,
   # and 25-100 step transitions.
-  net_pull_zero_prob: 1.0 # 0.4
+  net_pull_zero_prob: 0.4 # 0.4
+  net_pull_curriculum: true
+  net_pull_curriculum_end: 0.6
+  net_pull_zero_prob_start: 0.85
+  net_pull_force_scale_start: 0.25
   net_pull_ramp_up_range: [25, 100]
   net_pull_hold_range: [20, 200]
   net_pull_ramp_down_range: [25, 100]

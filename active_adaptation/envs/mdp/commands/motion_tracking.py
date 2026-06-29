@@ -1047,6 +1047,43 @@ class MotionTrackingCommand(Command):
         return _calc_exp_sigma(error, self.reward_sigma["ee"])
 
     @reward
+    def ee_rot_tracking(self):
+        """
+        Optional reward for tracking wrist orientations in the robot root frame.
+        This is separate from ee_tracking, which only tracks wrist positions.
+        """
+        motion = self._motion
+        wrist_names = ["left_hand_mimic", "right_hand_mimic"]
+        try:
+            wrist_idx_motion = [self.dataset.body_names.index(n) for n in wrist_names]
+            wrist_idx_asset = [self.asset.body_names.index(n) for n in wrist_names]
+        except ValueError:
+            return torch.zeros(self.num_envs, 1, device=self.device)
+
+        if hasattr(motion, "local_body_rot"):
+            target_wrist_quat_b = motion.local_body_rot[:, 0, wrist_idx_motion, :]
+        elif hasattr(motion, "body_quat_w") and hasattr(motion, "root_quat_w"):
+            target_root_quat_w = motion.root_quat_w[:, 0, :].unsqueeze(1)
+            target_wrist_quat_w = motion.body_quat_w[:, 0, wrist_idx_motion, :]
+            target_wrist_quat_b = quat_mul(
+                quat_conjugate(target_root_quat_w).expand(-1, len(wrist_idx_motion), -1),
+                target_wrist_quat_w,
+            )
+        else:
+            return torch.zeros(self.num_envs, 1, device=self.device)
+
+        actual_root_quat_w = self.asset.data.root_quat_w.unsqueeze(1)
+        actual_wrist_quat_w = self.asset.data.body_quat_w[:, wrist_idx_asset, :]
+        actual_wrist_quat_b = quat_mul(
+            quat_conjugate(actual_root_quat_w).expand(-1, len(wrist_idx_asset), -1),
+            actual_wrist_quat_w,
+        )
+
+        diff_quat = quat_mul(target_wrist_quat_b, quat_conjugate(actual_wrist_quat_b))
+        error = axis_angle_from_quat(diff_quat).norm(dim=-1).mean(dim=-1, keepdim=True)
+        return _calc_exp_sigma(error, self.reward_sigma["ee_rot"])
+
+    @reward
     def feet_tracking(self):
         motion = self._motion
         if hasattr(motion, "local_body_pos"):
@@ -1393,6 +1430,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_rest_range: Sequence[int] = (50, 150),
         net_pull_xy_only: bool = True,
         net_pull_zero_prob: float = 0.0,
+        net_pull_curriculum: bool = False,
+        net_pull_curriculum_end: float = 0.6,
+        net_pull_zero_prob_start: float = 0.85,
+        net_pull_force_scale_start: float = 0.25,
         net_pull_ee_compliance_stiffness: float = 200.0,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
@@ -1579,9 +1620,21 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.net_pull_ramp_down_range = tuple(int(x) for x in net_pull_ramp_down_range)
         self.net_pull_rest_range = tuple(int(x) for x in net_pull_rest_range)
         self.net_pull_xy_only = net_pull_xy_only
-        self.net_pull_zero_prob = float(net_pull_zero_prob)
-        if not 0.0 <= self.net_pull_zero_prob <= 1.0:
-            raise ValueError(f"net_pull_zero_prob must be in [0, 1], got {self.net_pull_zero_prob}.")
+        self.net_pull_zero_prob_target = float(net_pull_zero_prob)
+        self.net_pull_zero_prob = self.net_pull_zero_prob_target
+        self.net_pull_curriculum = bool(net_pull_curriculum)
+        self.net_pull_curriculum_end = float(net_pull_curriculum_end)
+        self.net_pull_zero_prob_start = float(net_pull_zero_prob_start)
+        self.net_pull_force_scale_start = float(net_pull_force_scale_start)
+        self.net_pull_force_scale = 1.0
+        if not 0.0 <= self.net_pull_zero_prob_target <= 1.0:
+            raise ValueError(f"net_pull_zero_prob must be in [0, 1], got {self.net_pull_zero_prob_target}.")
+        if self.net_pull_curriculum_end <= 0.0:
+            raise ValueError(f"net_pull_curriculum_end must be positive, got {self.net_pull_curriculum_end}.")
+        if not 0.0 <= self.net_pull_zero_prob_start <= 1.0:
+            raise ValueError(f"net_pull_zero_prob_start must be in [0, 1], got {self.net_pull_zero_prob_start}.")
+        if not 0.0 <= self.net_pull_force_scale_start <= 1.0:
+            raise ValueError(f"net_pull_force_scale_start must be in [0, 1], got {self.net_pull_force_scale_start}.")
         self.net_pull_ee_compliance_stiffness = float(net_pull_ee_compliance_stiffness)
         self.net_pull_ee_compliance_max_offset = float(net_pull_ee_compliance_max_offset)
         self.net_pull_ee_compliance_force_deadband = float(net_pull_ee_compliance_force_deadband)
@@ -1866,7 +1919,13 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             if zero_envs.numel() > 0:
                 self.net_pull_phase[zero_envs] = 0
                 self.net_pull_force_dir_w[zero_envs] = 0.0
-                self.net_pull_force_tl.set(zero_envs, end=0.0, total_steps=1)
+                self.net_pull_force_w[zero_envs] = 0.0
+                self.net_pull_force_b[zero_envs] = 0.0
+                self.net_pull_point_b[zero_envs] = 0.0
+                self.net_pull_force_tl.reset(
+                    zero_envs,
+                    value=torch.zeros(zero_envs.shape[0], 1, device=self.device),
+                )
                 self.net_pull_phase_timer[zero_envs] = random_uniform(
                     zero_envs.numel(),
                     self.net_pull_rest_range[0],
@@ -1886,7 +1945,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                     self.net_pull_force_range[0],
                     self.net_pull_force_range[1],
                     self.device,
-                )
+                ) * self.net_pull_force_scale
                 ramp_steps = random_uniform(
                     active_envs.numel(),
                     self.net_pull_ramp_up_range[0],
@@ -1922,6 +1981,13 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         if ramp_down_envs.numel() > 0:
             self.net_pull_phase[ramp_down_envs] = 0
             self.net_pull_force_dir_w[ramp_down_envs] = 0.0
+            self.net_pull_force_w[ramp_down_envs] = 0.0
+            self.net_pull_force_b[ramp_down_envs] = 0.0
+            self.net_pull_point_b[ramp_down_envs] = 0.0
+            self.net_pull_force_tl.reset(
+                ramp_down_envs,
+                value=torch.zeros(ramp_down_envs.shape[0], 1, device=self.device),
+            )
             self.net_pull_phase_timer[ramp_down_envs] = random_uniform(
                 ramp_down_envs.numel(),
                 self.net_pull_rest_range[0],
@@ -1941,6 +2007,11 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.asset.data.root_quat_w,
             point_w - self.asset.data.root_pos_w,
         )
+        inactive = self.net_pull_phase == 0
+        if inactive.any():
+            self.net_pull_force_w[inactive] = 0.0
+            self.net_pull_force_b[inactive] = 0.0
+            self.net_pull_point_b[inactive] = 0.0
     
     def force_schedule(self):
         # procedure:
@@ -2355,6 +2426,14 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
     def step_schedule(self, progress: float):
         self.zero_init_prob = 0.0
         self.force_alpha = 1.0
+        if self.external_force_mode == "net_pull" and self.net_pull_curriculum:
+            ratio = max(0.0, min(progress / self.net_pull_curriculum_end, 1.0))
+            self.net_pull_zero_prob = self.net_pull_zero_prob_start + ratio * (
+                self.net_pull_zero_prob_target - self.net_pull_zero_prob_start
+            )
+            self.net_pull_force_scale = self.net_pull_force_scale_start + ratio * (
+                1.0 - self.net_pull_force_scale_start
+            )
         if not self.student_train:
             ratio = max(0.25, min(progress / 0.6, 1.0))
             force_prob = 0.15 * ratio
@@ -2587,8 +2666,12 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     @observation
     def net_pull_force_priv(self):
+        active = self.net_pull_phase != 0
+
         body_one_hot = torch.zeros(self.num_envs, self.net_pull_num_bodies, device=self.device)
-        body_one_hot.scatter_(1, self.net_pull_body_local_idx.unsqueeze(1), 1.0)
+        active_envs = active.nonzero(as_tuple=False).squeeze(-1)
+        if active_envs.numel() > 0:
+            body_one_hot[active_envs, self.net_pull_body_local_idx[active_envs]] = 1.0
 
         phase_one_hot = torch.zeros(self.num_envs, 4, device=self.device)
         phase_idx = self.net_pull_phase.clamp(min=0, max=3).long()
@@ -2596,14 +2679,15 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
         timer = self.net_pull_phase_timer.clamp_min(0).float().unsqueeze(-1) / 250.0
         force_mag = self.net_pull_force_tl.current / max(self.net_pull_force_range[1], 1e-6)
+        active_f = active.float().unsqueeze(-1)
         return torch.cat([
-            self.net_pull_point_b,
-            self.net_pull_force_b / max(self.net_pull_force_range[1], 1e-6),
-            self.net_pull_force_w / max(self.net_pull_force_range[1], 1e-6),
+            self.net_pull_point_b * active_f,
+            (self.net_pull_force_b / max(self.net_pull_force_range[1], 1e-6)) * active_f,
+            (self.net_pull_force_w / max(self.net_pull_force_range[1], 1e-6)) * active_f,
             body_one_hot,
             phase_one_hot,
             timer,
-            force_mag,
+            force_mag * active_f,
         ], dim=-1)
 
     def net_pull_force_priv_sym(self):

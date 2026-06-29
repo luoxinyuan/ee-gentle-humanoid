@@ -112,7 +112,8 @@ reward:
     feet_contact_count: {weight: 0.0, enabled: false, body_names: .*ankle_roll_link}
   regularization:
     high_action_l2: {weight: 0.02}
-    high_action_rate_l2: {weight: 0.10}
+    high_action_rate_l2: {weight: 0.20}
+    high_action_rate2_l2: {weight: 0.10}
 
 termination:
   cum_error: {enabled: false}

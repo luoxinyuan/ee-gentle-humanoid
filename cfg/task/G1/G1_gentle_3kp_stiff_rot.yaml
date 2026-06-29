@@ -1,0 +1,9 @@
+name: G1GENTLE3KPSTIFFROT
+
+defaults:
+  - /task/G1/G1_gentle_3kp_stiff@_here_
+  - _self_
+
+reward:
+  tracking:
+    ee_rot_tracking: {weight: 0.5, enabled: true}

@@ -72,6 +72,7 @@ command:
     keypoint: [0.3] # product
     lower_keypoint: [0.3] # product
     ee: [0.2] # end-effector (wrist) tracking
+    ee_rot: [1.0, 0.5] # optional end-effector orientation tracking
     # feet: [0.2] # feet position tracking
 
     force_target: [0.3] # product
@@ -148,6 +149,7 @@ reward:
     joint_pos_tracking:    {weight: 1.0}
     joint_vel_tracking:    {weight: 0.5}
     ee_tracking:           {weight: 2.0}
+    ee_rot_tracking:       {weight: 0.0, enabled: false}
     # feet_tracking:         {weight: 2.0}
   loco:
     survival:           {weight: 5.0, enabled: true}
