@@ -182,7 +182,19 @@ class HierarchicalRootCommand(ActionManager):
         self.root_storage_dim = 5
         self.ee_command_cfg = dict(ee_command or {})
         self.ee_command_enabled = self.ee_command_cfg.get("enabled", False)
-        self.ee_command_dim = 12 if self.ee_command_enabled else 0
+        self.ee_command_mode = self.ee_command_cfg.get("mode", "pose_delta")
+        self.ee_storage_dim = 12 if self.ee_command_enabled else 0
+        if not self.ee_command_enabled:
+            self.ee_command_dim = 0
+        elif self.ee_command_mode == "pose_delta":
+            self.ee_command_dim = 12
+        elif self.ee_command_mode == "pos_delta":
+            self.ee_command_dim = 6
+        else:
+            raise ValueError(
+                "HierarchicalRootCommand ee_command.mode must be one of "
+                f"['pose_delta', 'pos_delta'], got {self.ee_command_mode!r}."
+            )
         self.feet_command_cfg = dict(feet_command or {})
         self.feet_command_enabled = self.feet_command_cfg.get("enabled", False)
         self.feet_command_dim = 6 if self.feet_command_enabled else 0
@@ -225,7 +237,7 @@ class HierarchicalRootCommand(ActionManager):
 
         self.high_action_buf = torch.zeros(self.num_envs, 3, self.action_dim, device=self.device)
         self.root_command = torch.zeros(self.num_envs, self.root_storage_dim, device=self.device)
-        self.ee_command = torch.zeros(self.num_envs, self.ee_command_dim, device=self.device)
+        self.ee_command = torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
         self.feet_command = torch.zeros(self.num_envs, self.feet_command_dim, device=self.device)
         self.low_action = torch.zeros(self.num_envs, self.low_action_manager.action_dim, device=self.device)
         self._reset_root_command(torch.arange(self.num_envs, device=self.device))
@@ -278,7 +290,7 @@ class HierarchicalRootCommand(ActionManager):
             return self.env.command_manager.get_root_and_wrist_6d_reference()
         if hasattr(self.env.command_manager, "root_and_wrist_6d"):
             return self.env.command_manager.root_and_wrist_6d()
-        return torch.zeros(self.num_envs, self.ee_command_dim, device=self.device)
+        return torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
 
     def _reset_ee_command(self, env_ids: torch.Tensor):
         if not self.ee_command_enabled:
@@ -337,12 +349,16 @@ class HierarchicalRootCommand(ActionManager):
     def _decode_ee_command(self, raw_action: torch.Tensor) -> torch.Tensor:
         reference = self._get_ee_command_reference()
         action = torch.tanh(raw_action)
-        pos_delta = action[:, :6].reshape(self.num_envs, 2, 3) * self.ee_pos_scale
-        rot_delta = action[:, 6:12].reshape(self.num_envs, 2, 3) * self.ee_rot_scale
 
         command = reference.clone()
-        command[:, :6] = reference[:, :6] + pos_delta.reshape(self.num_envs, 6)
-        command[:, 6:12] = reference[:, 6:12] + rot_delta.reshape(self.num_envs, 6)
+        if self.ee_command_mode == "pose_delta":
+            pos_delta = action[:, :6].reshape(self.num_envs, 2, 3) * self.ee_pos_scale
+            rot_delta = action[:, 6:12].reshape(self.num_envs, 2, 3) * self.ee_rot_scale
+            command[:, :6] = reference[:, :6] + pos_delta.reshape(self.num_envs, 6)
+            command[:, 6:12] = reference[:, 6:12] + rot_delta.reshape(self.num_envs, 6)
+        elif self.ee_command_mode == "pos_delta":
+            pos_delta = action.reshape(self.num_envs, 2, 3) * self.ee_pos_scale
+            command[:, :6] = reference[:, :6] + pos_delta.reshape(self.num_envs, 6)
         return command
 
     def _decode_feet_command(self, raw_action: torch.Tensor) -> torch.Tensor:

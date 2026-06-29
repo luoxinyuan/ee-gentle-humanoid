@@ -10,14 +10,25 @@ command:
 observation:
   hl_policy:
     root_and_wrist_6d: {enabled: false}
+    feet_pos_b: {enabled: false}
     root_and_wrist_6d_reference: {}
     ee_compliance_state:
+      enabled: false
       stiffness: ${task.reward.ee_compliance.ee_force_compliance_tracking.stiffness}
       max_offset: ${task.reward.ee_compliance.ee_force_compliance_tracking.max_offset}
       force_deadband: ${task.reward.ee_compliance.ee_force_compliance_tracking.force_deadband}
     prev_high_actions: {steps: 3}
 
 reward:
+  loco:
+    survival: {weight: 0.0, enabled: false}
+    impact_force_l2: {weight: 0.0, enabled: false}
+    feet_slip: {weight: 0.0, enabled: false}
+    joint_vel_l2: {weight: 0.0, enabled: false}
+    action_rate_l2: {weight: 0.0, enabled: false}
+    feet_air_time_ref: {weight: 0.0, enabled: false}
+    joint_pos_limits: {weight: 0.0, enabled: false}
+    feet_contact_count: {weight: 0.0, enabled: false}
   root_hold:
     root_position_hold: {weight: 0.0, sigma: 0.25, mode: xy, enabled: false}
     root_height_hold: {weight: 0.0, sigma: 0.08, target_height: 0.79, enabled: false}
