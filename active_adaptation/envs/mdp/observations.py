@@ -2,7 +2,9 @@ import torch
 import numpy as np
 import abc
 import einops
+from collections.abc import Sequence as SequenceABC
 from typing import Tuple, TYPE_CHECKING, Callable
+from omegaconf import ListConfig
 
 from isaaclab.utils.string import resolve_matching_names
 import active_adaptation
@@ -18,6 +20,20 @@ if TYPE_CHECKING:
 
 if active_adaptation.get_backend() == "isaac":
     import isaaclab.sim as sim_utils
+
+
+def _parse_xyz_or_scalar(value, *, name: str, device: torch.device) -> tuple[torch.Tensor | float, bool]:
+    if isinstance(value, (SequenceABC, ListConfig)) and not isinstance(value, (str, bytes)):
+        if len(value) != 3:
+            raise ValueError(f"{name} must be a scalar or 3 xyz values, got {value}.")
+        tensor = torch.tensor(value, dtype=torch.float32, device=device).reshape(1, 1, 3)
+        if torch.any(tensor <= 0.0):
+            raise ValueError(f"{name} must be positive, got {value}.")
+        return tensor, True
+    scalar = float(value)
+    if scalar <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value}.")
+    return scalar, False
     from isaaclab.terrains.trimesh.utils import make_plane
     from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
     from pxr import UsdGeom, UsdPhysics
@@ -376,11 +392,18 @@ class ee_compliance_state(Observation):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
         self.body_names = list(body_names)
-        self.stiffness = float(stiffness)
-        self.max_offset = float(max_offset)
+        self.stiffness, stiffness_directional = _parse_xyz_or_scalar(
+            stiffness,
+            name="ee_compliance_state.stiffness",
+            device=self.device,
+        )
+        self.max_offset, offset_directional = _parse_xyz_or_scalar(
+            max_offset,
+            name="ee_compliance_state.max_offset",
+            device=self.device,
+        )
+        self.directional = stiffness_directional or offset_directional
         self.force_deadband = float(force_deadband)
-        if self.stiffness <= 0.0:
-            raise ValueError(f"ee_compliance_state stiffness must be positive, got {self.stiffness}.")
 
         try:
             self.motion_ids = torch.tensor(
@@ -433,7 +456,14 @@ class ee_compliance_state(Observation):
 
         active = force_b.norm(dim=-1, keepdim=True) > self.force_deadband
         active_force_b = torch.where(active, force_b, torch.zeros_like(force_b))
-        target_offset_b = clamp_norm(active_force_b / self.stiffness, max=self.max_offset)
+        if self.directional:
+            target_offset_b = torch.clamp(
+                active_force_b / self.stiffness,
+                min=-self.max_offset,
+                max=self.max_offset,
+            )
+        else:
+            target_offset_b = clamp_norm(active_force_b / self.stiffness, max=self.max_offset)
         return nominal_target_b + target_offset_b
 
     def compute(self):

@@ -1411,6 +1411,23 @@ class MotionTrackingCommand(Command):
 
 from .utils import TemporalLerp, clamp_norm, create_mapping, rand_points_disk, rand_points_isotropic, random_uniform
 import os
+from collections.abc import Sequence as SequenceABC
+from omegaconf import ListConfig
+
+
+def _parse_xyz_or_scalar(value, *, name: str, device: torch.device) -> tuple[torch.Tensor, bool]:
+    if isinstance(value, (SequenceABC, ListConfig)) and not isinstance(value, (str, bytes)):
+        if len(value) != 3:
+            raise ValueError(f"{name} must be a scalar or 3 xyz values, got {value}.")
+        tensor = torch.tensor(value, dtype=torch.float32, device=device).reshape(1, 1, 3)
+        directional = True
+    else:
+        tensor = torch.tensor(float(value), dtype=torch.float32, device=device)
+        directional = False
+    if torch.any(tensor <= 0.0):
+        raise ValueError(f"{name} must be positive, got {value}.")
+    return tensor, directional
+
 
 class MotionTrackingCommand_impedance(MotionTrackingCommand):
     def __init__(
@@ -1635,14 +1652,24 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             raise ValueError(f"net_pull_zero_prob_start must be in [0, 1], got {self.net_pull_zero_prob_start}.")
         if not 0.0 <= self.net_pull_force_scale_start <= 1.0:
             raise ValueError(f"net_pull_force_scale_start must be in [0, 1], got {self.net_pull_force_scale_start}.")
-        self.net_pull_ee_compliance_stiffness = float(net_pull_ee_compliance_stiffness)
-        self.net_pull_ee_compliance_max_offset = float(net_pull_ee_compliance_max_offset)
+        (
+            self.net_pull_ee_compliance_stiffness,
+            stiffness_directional,
+        ) = _parse_xyz_or_scalar(
+            net_pull_ee_compliance_stiffness,
+            name="net_pull_ee_compliance_stiffness",
+            device=self.device,
+        )
+        (
+            self.net_pull_ee_compliance_max_offset,
+            offset_directional,
+        ) = _parse_xyz_or_scalar(
+            net_pull_ee_compliance_max_offset,
+            name="net_pull_ee_compliance_max_offset",
+            device=self.device,
+        )
+        self.net_pull_ee_compliance_directional = stiffness_directional or offset_directional
         self.net_pull_ee_compliance_force_deadband = float(net_pull_ee_compliance_force_deadband)
-        if self.net_pull_ee_compliance_stiffness <= 0.0:
-            raise ValueError(
-                "net_pull_ee_compliance_stiffness must be positive, got "
-                f"{self.net_pull_ee_compliance_stiffness}."
-            )
 
         self.configure_admittance()
         self.configure_net_pull()
@@ -1771,11 +1798,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                 v0_b=nominal_vel_b[self.last_reset_env_ids],
             )
 
-        stiffness = torch.as_tensor(
-            self.net_pull_ee_compliance_stiffness,
-            device=self.device,
-            dtype=torch.float32,
-        )
+        stiffness = self.net_pull_ee_compliance_stiffness
         mass = torch.as_tensor(self.net_pull_ee_admit.mass, device=self.device, dtype=torch.float32)
         damping = 2.0 * torch.sqrt(stiffness * mass)
 
@@ -1791,10 +1814,15 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.net_pull_ee_admit.step(F_drive_b=F_drive_b, F_ext_b=force_b_exp)
 
         target_b = self.net_pull_ee_admit.x[0]
-        offset_b = clamp_norm(
-            target_b - nominal_target_b,
-            max=self.net_pull_ee_compliance_max_offset,
-        )
+        offset_b = target_b - nominal_target_b
+        if self.net_pull_ee_compliance_directional:
+            offset_b = torch.clamp(
+                offset_b,
+                min=-self.net_pull_ee_compliance_max_offset,
+                max=self.net_pull_ee_compliance_max_offset,
+            )
+        else:
+            offset_b = clamp_norm(offset_b, max=float(self.net_pull_ee_compliance_max_offset.item()))
         self.net_pull_ee_compliance_target_b[:] = nominal_target_b + offset_b
         self.net_pull_ee_admit.x[0] = self.net_pull_ee_compliance_target_b
 

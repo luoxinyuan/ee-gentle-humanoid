@@ -10,8 +10,10 @@ defaults:
 observation:
   hl_policy:
     ee_compliance_state: {enabled: false}
-  hl_priv:
+  hl_force_priv:
     net_pull_force_priv: {}
+  hl_priv:
+    net_pull_force_priv: {enabled: false}
     ee_compliance_state:
       enabled: false
       stiffness: ${task.reward.ee_compliance.ee_force_compliance_tracking.stiffness}

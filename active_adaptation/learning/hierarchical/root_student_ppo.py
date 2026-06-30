@@ -52,9 +52,11 @@ class RootStudentPPOConfig:
     reg_lambda: float = 0.2
     vecnorm: str | None = None
     phase: str = "train"  # train | adapt | finetune
+    direct_pred_weight: float = 1.0
 
     in_keys: List[str] = field(default_factory=lambda: ["hl_policy"])
     priv_in_keys: List[str] = field(default_factory=lambda: ["hl_priv"])
+    direct_priv_keys: List[str] = field(default_factory=list)
     critic_in_keys: List[str] = field(default_factory=lambda: ["hl_policy", "hl_priv"])
 
 
@@ -90,7 +92,10 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
 
         actor_in_keys = list(cfg.in_keys)
         priv_in_keys = list(cfg.priv_in_keys)
+        direct_priv_keys = list(cfg.direct_priv_keys)
         critic_in_keys = list(cfg.critic_in_keys)
+        self.direct_priv_keys = direct_priv_keys
+        self.direct_pred_key = "direct_priv_pred"
 
         self.encoder_priv = Seq(
             CatTensors(priv_in_keys, "_priv_inp", del_keys=False, sort=False),
@@ -110,8 +115,25 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
             ),
         ).to(self.device)
 
-        self.actor_teacher = self._build_actor(actor_in_keys + ["priv_feature"])
-        self.actor_student = self._build_actor(actor_in_keys + ["priv_pred"])
+        self.adapt_direct_module = None
+        if self.direct_priv_keys:
+            fake_td = observation_spec.zero().to(self.device)
+            direct_dim = self._cat_direct_priv(fake_td).shape[-1]
+            self.adapt_direct_module = Seq(
+                CatTensors(actor_in_keys, "_direct_inp", del_keys=False, sort=False),
+                Mod(
+                    nn.Sequential(make_mlp([512, 256], norm=cfg.layer_norm), nn.LazyLinear(direct_dim)),
+                    ["_direct_inp"],
+                    [self.direct_pred_key],
+                ),
+            ).to(self.device)
+
+        teacher_extra_keys = ["priv_feature"] + self.direct_priv_keys
+        student_extra_keys = ["priv_pred"]
+        if self.direct_priv_keys:
+            student_extra_keys.append(self.direct_pred_key)
+        self.actor_teacher = self._build_actor(actor_in_keys + teacher_extra_keys)
+        self.actor_student = self._build_actor(actor_in_keys + student_extra_keys)
 
         self.critic = Seq(
             CatTensors(critic_in_keys, "_critic_inp", del_keys=False, sort=False),
@@ -126,6 +148,8 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
         fake_td["is_init"] = torch.ones(fake_td.shape[0], 1, dtype=torch.bool, device=self.device)
         self.encoder_priv(fake_td)
         self.adapt_module(fake_td)
+        if self.adapt_direct_module is not None:
+            self.adapt_direct_module(fake_td)
         self.actor_teacher(fake_td)
         self.actor_student(fake_td)
         self.critic(fake_td)
@@ -141,6 +165,8 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
             )
             self.encoder_priv = DDP(self.encoder_priv, **ddp_kwargs)
             self.adapt_module = DDP(self.adapt_module, **ddp_kwargs)
+            if self.adapt_direct_module is not None:
+                self.adapt_direct_module = DDP(self.adapt_direct_module, **ddp_kwargs)
             self.actor_teacher = DDP(self.actor_teacher, **ddp_kwargs)
             self.actor_student = DDP(self.actor_student, **ddp_kwargs)
             self.critic = DDP(self.critic, **ddp_kwargs)
@@ -149,12 +175,43 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
             list(self.encoder_priv.parameters()) + list(self.actor_teacher.parameters()),
             lr=cfg.lr,
         )
-        self.opt_student = torch.optim.Adam(
-            list(self.adapt_module.parameters()) + list(self.actor_student.parameters()),
-            lr=cfg.lr,
-        )
+        student_params = list(self.adapt_module.parameters()) + list(self.actor_student.parameters())
+        if self.adapt_direct_module is not None:
+            student_params += list(self.adapt_direct_module.parameters())
+        self.opt_student = torch.optim.Adam(student_params, lr=cfg.lr)
         self.opt_estimator = torch.optim.Adam(self.adapt_module.parameters(), lr=cfg.lr)
+        self.opt_direct_estimator = None
+        if self.adapt_direct_module is not None:
+            self.opt_direct_estimator = torch.optim.Adam(self.adapt_direct_module.parameters(), lr=cfg.lr)
         self.opt_critic = torch.optim.Adam(self.critic.parameters(), lr=cfg.lr)
+
+    def _cat_direct_priv(self, tensordict: TensorDict) -> torch.Tensor:
+        if not self.direct_priv_keys:
+            raise RuntimeError("_cat_direct_priv called without direct_priv_keys.")
+        return torch.cat([tensordict[key] for key in self.direct_priv_keys], dim=-1)
+
+    def _student_estimators(self):
+        modules = [self.adapt_module]
+        if self.adapt_direct_module is not None:
+            modules.append(self.adapt_direct_module)
+        return modules
+
+    @staticmethod
+    def _run_encoder(encoder, tensordict: TensorDict):
+        if isinstance(encoder, (list, tuple)):
+            for module in encoder:
+                module(tensordict)
+            return tensordict
+        return encoder(tensordict)
+
+    @staticmethod
+    def _encoder_parameters(encoder):
+        if isinstance(encoder, (list, tuple)):
+            params = []
+            for module in encoder:
+                params.extend(list(module.parameters()))
+            return params
+        return encoder.parameters()
 
     def _build_actor(self, in_keys: list[str]):
         return ProbabilisticActor(
@@ -182,10 +239,10 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
 
     def get_rollout_policy(self, mode: str = "train"):
         if mode in {"eval", "deploy"}:
-            return Seq(self.adapt_module, self.actor_student)
+            return Seq(*self._student_estimators(), self.actor_student)
         if self.cfg.phase == "train":
             return Seq(self.encoder_priv, self.actor_teacher)
-        return Seq(self.adapt_module, self.actor_student)
+        return Seq(*self._student_estimators(), self.actor_student)
 
     def broadcast_parameters(self, extra_modules=[]):
         return None
@@ -206,7 +263,10 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
         elif 0.0 < kl < self.cfg.desired_kl / 2.0:
             new_lr = min(5e-3, new_lr * 1.1)
         self.current_lr = new_lr
-        for opt in (self.opt_teacher, self.opt_student, self.opt_estimator, self.opt_critic):
+        opts = [self.opt_teacher, self.opt_student, self.opt_estimator, self.opt_critic]
+        if self.opt_direct_estimator is not None:
+            opts.append(self.opt_direct_estimator)
+        for opt in opts:
             for group in opt.param_groups:
                 group["lr"] = self.current_lr
 
@@ -216,7 +276,7 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
             info.update(self._train_estimator(td))
             self._copy_teacher_to_student()
         elif self.cfg.phase == "finetune":
-            info = self._ppo_update(td, actor=self.actor_student, encoder=self.adapt_module, opt_actor=self.opt_student)
+            info = self._ppo_update(td, actor=self.actor_student, encoder=self._student_estimators(), opt_actor=self.opt_student)
         else:
             info = self._train_estimator(td)
         self.num_updates += 1
@@ -266,7 +326,7 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
         valid = ~mb["is_init"]
 
         mb = mb.exclude("next", "sample_log_prob", "action")
-        encoder(mb)
+        self._run_encoder(encoder, mb)
         actor(mb)
         values = self.critic(mb)["state_value"]
 
@@ -286,7 +346,7 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
         self.opt_critic.zero_grad()
         loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-        encoder_grad_norm = nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
+        encoder_grad_norm = nn.utils.clip_grad_norm_(self._encoder_parameters(encoder), 1.0)
         critic_grad_norm = nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         opt_actor.step()
         self.opt_critic.step()
@@ -328,15 +388,31 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
 
         estimator_loss = F.mse_loss(mb["priv_pred"], mb["priv_feature"], reduction="none")
         estimator_loss = torch.mean(estimator_loss * valid)
+        direct_loss = torch.zeros((), device=estimator_loss.device)
+        if self.adapt_direct_module is not None:
+            self.adapt_direct_module(mb)
+            direct_target = self._cat_direct_priv(mb)
+            direct_loss = F.mse_loss(mb[self.direct_pred_key], direct_target, reduction="none")
+            direct_loss = torch.mean(direct_loss * valid)
 
+        loss = estimator_loss + self.cfg.direct_pred_weight * direct_loss
         self.opt_estimator.zero_grad()
-        estimator_loss.backward()
+        if self.opt_direct_estimator is not None:
+            self.opt_direct_estimator.zero_grad()
+        loss.backward()
         estimator_grad_norm = nn.utils.clip_grad_norm_(self.adapt_module.parameters(), 1.0)
+        direct_grad_norm = torch.zeros((), device=estimator_loss.device)
+        if self.adapt_direct_module is not None:
+            direct_grad_norm = nn.utils.clip_grad_norm_(self.adapt_direct_module.parameters(), 1.0)
         self.opt_estimator.step()
+        if self.opt_direct_estimator is not None:
+            self.opt_direct_estimator.step()
 
         return {
             "adapt/estimator_loss": estimator_loss.detach(),
+            "adapt/direct_loss": direct_loss.detach(),
             "adapt/estimator_grad_norm": estimator_grad_norm.detach(),
+            "adapt/direct_grad_norm": direct_grad_norm.detach(),
         }
 
     def state_dict(self):
@@ -344,8 +420,11 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
         actor_student = self.actor_student.module if isinstance(self.actor_student, DDP) else self.actor_student
         encoder_priv = self.encoder_priv.module if isinstance(self.encoder_priv, DDP) else self.encoder_priv
         adapt_module = self.adapt_module.module if isinstance(self.adapt_module, DDP) else self.adapt_module
+        adapt_direct_module = None
+        if self.adapt_direct_module is not None:
+            adapt_direct_module = self.adapt_direct_module.module if isinstance(self.adapt_direct_module, DDP) else self.adapt_direct_module
         critic = self.critic.module if isinstance(self.critic, DDP) else self.critic
-        return OrderedDict(
+        state = OrderedDict(
             actor_teacher=actor_teacher.state_dict(),
             actor_student=actor_student.state_dict(),
             encoder_priv=encoder_priv.state_dict(),
@@ -360,18 +439,26 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
                 "num_updates": self.num_updates,
             },
         )
+        if adapt_direct_module is not None:
+            state["adapt_direct_module"] = adapt_direct_module.state_dict()
+        return state
 
     def load_state_dict(self, state_dict, strict=True):
         actor_teacher = self.actor_teacher.module if isinstance(self.actor_teacher, DDP) else self.actor_teacher
         actor_student = self.actor_student.module if isinstance(self.actor_student, DDP) else self.actor_student
         encoder_priv = self.encoder_priv.module if isinstance(self.encoder_priv, DDP) else self.encoder_priv
         adapt_module = self.adapt_module.module if isinstance(self.adapt_module, DDP) else self.adapt_module
+        adapt_direct_module = None
+        if self.adapt_direct_module is not None:
+            adapt_direct_module = self.adapt_direct_module.module if isinstance(self.adapt_direct_module, DDP) else self.adapt_direct_module
         critic = self.critic.module if isinstance(self.critic, DDP) else self.critic
 
         actor_teacher.load_state_dict(state_dict.get("actor_teacher", {}), strict=strict)
         actor_student.load_state_dict(state_dict.get("actor_student", {}), strict=strict)
         encoder_priv.load_state_dict(state_dict.get("encoder_priv", {}), strict=strict)
         adapt_module.load_state_dict(state_dict.get("adapt_module", {}), strict=strict)
+        if adapt_direct_module is not None and "adapt_direct_module" in state_dict:
+            adapt_direct_module.load_state_dict(state_dict["adapt_direct_module"], strict=strict)
         critic.load_state_dict(state_dict.get("critic", {}), strict=strict)
 
         last_phase = state_dict.get("last_phase", "train")

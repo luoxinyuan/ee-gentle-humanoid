@@ -1,7 +1,9 @@
 from math import inf
+from collections.abc import Sequence as SequenceABC
 import torch
 import abc
 from typing import TYPE_CHECKING, Callable, List, Sequence, Tuple
+from omegaconf import ListConfig
 
 import isaaclab.utils.string as string_utils
 from isaaclab.utils.string import resolve_matching_names
@@ -85,6 +87,20 @@ def reward_wrapper(func: Callable[[], torch.Tensor]):
         def compute(self):
             return func()
     return RewardWrapper
+
+
+def _parse_xyz_or_scalar(value, *, name: str, device: torch.device) -> tuple[torch.Tensor | float, bool]:
+    if isinstance(value, (SequenceABC, ListConfig)) and not isinstance(value, (str, bytes)):
+        if len(value) != 3:
+            raise ValueError(f"{name} must be a scalar or 3 xyz values, got {value}.")
+        tensor = torch.tensor(value, dtype=torch.float32, device=device).reshape(1, 1, 3)
+        if torch.any(tensor <= 0.0):
+            raise ValueError(f"{name} must be positive, got {value}.")
+        return tensor, True
+    scalar = float(value)
+    if scalar <= 0.0:
+        raise ValueError(f"{name} must be positive, got {value}.")
+    return scalar, False
 
 
 @reward_func
@@ -369,9 +385,18 @@ class ee_force_compliance_tracking(Reward):
     ):
         super().__init__(env, weight, enabled)
         self.asset: Articulation = self.env.scene["robot"]
-        self.stiffness = stiffness
+        self.stiffness, stiffness_directional = _parse_xyz_or_scalar(
+            stiffness,
+            name="ee_force_compliance_tracking.stiffness",
+            device=self.device,
+        )
         self.sigma = sigma
-        self.max_offset = max_offset
+        self.max_offset, offset_directional = _parse_xyz_or_scalar(
+            max_offset,
+            name="ee_force_compliance_tracking.max_offset",
+            device=self.device,
+        )
+        self.directional = stiffness_directional or offset_directional
         self.force_deadband = force_deadband
         self.ee_names = ["left_hand_mimic", "right_hand_mimic"]
 
@@ -426,7 +451,14 @@ class ee_force_compliance_tracking(Reward):
             force_b = quat_apply_inverse(root_quat.expand(-1, 2, -1), force_w)
             force_norm = force_b.norm(dim=-1, keepdim=True)
             active_force = torch.where(force_norm > self.force_deadband, force_b, torch.zeros_like(force_b))
-            target_offset_b = clamp_norm(active_force / self.stiffness, max=self.max_offset)
+            if self.directional:
+                target_offset_b = torch.clamp(
+                    active_force / self.stiffness,
+                    min=-self.max_offset,
+                    max=self.max_offset,
+                )
+            else:
+                target_offset_b = clamp_norm(active_force / self.stiffness, max=self.max_offset)
             compliance_target_b = target_ee_b + target_offset_b
 
         actual_ee_w = self.asset.data.body_pos_w[:, asset_idx, :]
