@@ -38,7 +38,7 @@ reward:
       stiffness: 200.0
       sigma: 0.10
       max_offset: 0.25
-      force_deadband: 5.0
+      force_deadband: 0.0
     ee_orientation_tracking:
       weight: 0.0
       sigma: [1.0, 0.5]
