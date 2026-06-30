@@ -1674,6 +1674,11 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.configure_admittance()
         self.configure_net_pull()
         self.configure_net_pull_ee_compliance()
+        self.eval_ee_force_enabled = False
+        self.eval_ee_force_body_idx_asset = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.eval_ee_force_body_local_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.eval_ee_force_b = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
+        self.eval_ee_force_w = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
 
     def set_external_force_enabled(self, enabled: bool):
         self.external_force_enabled = bool(enabled)
@@ -1834,6 +1839,60 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     def get_net_pull_ee_force_b(self):
         return self.net_pull_ee_force_b
+
+    def set_eval_ee_force_b(self, ee_index: int, force_b: torch.Tensor):
+        if ee_index < 0 or ee_index >= len(self.net_pull_ee_idx_asset):
+            raise ValueError(f"ee_index must be in [0, {len(self.net_pull_ee_idx_asset) - 1}], got {ee_index}.")
+        if force_b.ndim == 1:
+            force_b = force_b.unsqueeze(0).expand(self.num_envs, -1)
+        force_b = force_b.to(device=self.device, dtype=torch.float32)
+        if force_b.shape != (self.num_envs, 3):
+            raise ValueError(f"force_b must have shape {(self.num_envs, 3)} or (3,), got {tuple(force_b.shape)}.")
+
+        body_idx = self.net_pull_ee_idx_asset[ee_index]
+        matches = (self.net_pull_idx_asset == body_idx).nonzero(as_tuple=False).flatten()
+        if matches.numel() == 0:
+            body_name = self.asset.body_names[int(body_idx.item())]
+            raise RuntimeError(f"Eval EE force body {body_name} is not present in net_pull_apply_pattern.")
+
+        self.eval_ee_force_enabled = True
+        self.eval_ee_force_body_idx_asset[:] = body_idx
+        self.eval_ee_force_body_local_idx[:] = matches[0]
+        self.eval_ee_force_b[:] = force_b
+
+    def clear_eval_ee_force(self):
+        self.eval_ee_force_enabled = False
+        self.eval_ee_force_b.zero_()
+        self.eval_ee_force_w.zero_()
+        if hasattr(self, "net_pull_force_w"):
+            self.net_pull_force_w.zero_()
+            self.net_pull_force_b.zero_()
+            self.net_pull_ee_force_b.zero_()
+            self.force_applied_w.zero_()
+            self.force_applied_b.zero_()
+            self.force_apply_buffer.zero_()
+            self.torque_apply_buffer.zero_()
+        if hasattr(self, "update_net_pull_ee_compliance_target"):
+            self.update_net_pull_ee_compliance_target()
+
+    def _update_eval_ee_force_target(self):
+        self.net_pull_body_local_idx[:] = self.eval_ee_force_body_local_idx
+        self.net_pull_force_b[:] = self.eval_ee_force_b
+        self.net_pull_force_w[:] = quat_apply(self.asset.data.root_quat_w, self.eval_ee_force_b)
+        self.eval_ee_force_w[:] = self.net_pull_force_w
+        self.net_pull_force_dir_w[:] = normalize(self.net_pull_force_w)
+        self.net_pull_force_tl.current[:] = self.net_pull_force_w.norm(dim=-1, keepdim=True)
+        self.net_pull_phase[:] = 2
+        self.net_pull_phase_timer[:] = 1
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        point_w = self.asset.data.body_pos_w[env_ids, self.eval_ee_force_body_idx_asset]
+        self.net_pull_point_b[:] = quat_apply_inverse(
+            self.asset.data.root_quat_w,
+            point_w - self.asset.data.root_pos_w,
+        )
+        self.force_sample_timer[:] = 1
+        self.update_net_pull_ee_compliance_target()
 
     def update_force_kp_matrix(self):
         diag = torch.cat([
@@ -2404,6 +2463,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         if not self.external_force_enabled:
             self.set_external_force_enabled(False)
             return
+        if getattr(self, "eval_ee_force_enabled", False):
+            self._update_eval_ee_force_target()
+            return
         if self.external_force_mode == "net_pull":
             self.force_safe_limit_tl.update_time()
             self.net_pull_force_tl.update_time()
@@ -2424,6 +2486,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         super().step(substep)
         if not self.external_force_enabled:
             self.set_external_force_enabled(False)
+            return
+        if getattr(self, "eval_ee_force_enabled", False):
+            self.force_apply_net_pull(substep)
+            self._limit_net_wrench_about_torso()
             return
         if self.external_force_mode == "net_pull":
             self.force_apply_net_pull(substep)

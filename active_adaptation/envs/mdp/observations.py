@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 
 if active_adaptation.get_backend() == "isaac":
     import isaaclab.sim as sim_utils
+    from isaaclab.terrains.trimesh.utils import make_plane
+    from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
+    from pxr import UsdGeom, UsdPhysics
 
 
 def _parse_xyz_or_scalar(value, *, name: str, device: torch.device) -> tuple[torch.Tensor | float, bool]:
@@ -34,9 +37,6 @@ def _parse_xyz_or_scalar(value, *, name: str, device: torch.device) -> tuple[tor
     if scalar <= 0.0:
         raise ValueError(f"{name} must be positive, got {value}.")
     return scalar, False
-    from isaaclab.terrains.trimesh.utils import make_plane
-    from isaaclab.utils.warp import convert_to_warp_mesh, raycast_mesh
-    from pxr import UsdGeom, UsdPhysics
 
 
 class Observation:

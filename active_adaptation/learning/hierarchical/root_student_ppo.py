@@ -92,9 +92,10 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
 
         actor_in_keys = list(cfg.in_keys)
         priv_in_keys = list(cfg.priv_in_keys)
-        direct_priv_keys = list(cfg.direct_priv_keys)
+        direct_priv_keys = list(cfg.get("direct_priv_keys", []))
         critic_in_keys = list(cfg.critic_in_keys)
         self.direct_priv_keys = direct_priv_keys
+        self.direct_pred_weight = float(cfg.get("direct_pred_weight", 1.0))
         self.direct_pred_key = "direct_priv_pred"
 
         self.encoder_priv = Seq(
@@ -395,7 +396,7 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
             direct_loss = F.mse_loss(mb[self.direct_pred_key], direct_target, reduction="none")
             direct_loss = torch.mean(direct_loss * valid)
 
-        loss = estimator_loss + self.cfg.direct_pred_weight * direct_loss
+        loss = estimator_loss + self.direct_pred_weight * direct_loss
         self.opt_estimator.zero_grad()
         if self.opt_direct_estimator is not None:
             self.opt_direct_estimator.zero_grad()
