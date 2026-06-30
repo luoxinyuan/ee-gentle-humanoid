@@ -1,0 +1,11 @@
+name: G1GENTLELIMMTFORCE30SAFEDEFAULT
+
+defaults:
+  - /task/G1/G1_gentle@_here_
+  - _self_
+
+command:
+  max_force: 30.0
+  net_force_limit: 30.0
+  force_safe_bounds: [5.0, 15.0]
+  force_safe_default: 10.0

@@ -3,9 +3,9 @@ set -euo pipefail
 
 # ===== Global Configuration =====
 PROJECT="luoxinyuan-duke-university/gentle_humanoid"
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,4
 MASTER_PORT=29507
-NPROC=2
+NPROC=4
 SCRIPT="scripts/train.py"
 
 run_pipeline() {
@@ -44,7 +44,9 @@ run_pipeline() {
 # run_pipeline "G1/G1_gentle_3kp" "gentle_3kp" "limmt_full_stiff30"
 # run_pipeline "G1/G1_gentle_5kp" "gentle_5kp" "limmt_full_stiff30"
 # run_pipeline "G1/G1_gentle_3kp_stiff" "3kp_stiff_aug" "limmt_full_force30"
-run_pipeline "G1/G1_gentle_3kp_stiff_rot" "3kp_stiff_rot" "limmt_full_force30_ee_rot05"
+# run_pipeline "G1/G1_gentle_3kp_stiff_rot" "3kp_stiff_rot" "limmt_full_force30_ee_rot05"
+run_pipeline "G1/G1_gentle_limmt_force30_safe_default" "gentle" "limmt_full_force30_safe_default"
+run_pipeline "G1/G1_gentle_5kp_limmt_force30_safe_default" "gentle_5kp" "limmt_full_force30_safe_default"
 
 # run_pipeline "G1/G1_no_force" "noforce" "motion_tracking_RL"
 # run_pipeline "G1/G1_extreme_force" "extremeforce" "1215"
