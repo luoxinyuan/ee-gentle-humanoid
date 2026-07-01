@@ -4,13 +4,13 @@ set -euo pipefail
 LOW_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid"
 HL_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid_high_level"
 HL_WANDB_PROJECT="gentle_humanoid_high_level"
-CUDA_VISIBLE_DEVICES="2,3"
+CUDA_VISIBLE_DEVICES="3,4,5"
 MASTER_PORT="29502"
-NPROC="2"
+NPROC="3"
 
-TASK="G1/G1_hl_ee_y_compliance_pos_delta_student"
+TASK="G1/G1_hl_ee_compliance_pos_delta_student"
 LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30"
-RUN_NAME="hl_ee_y_compliance_pos_delta015_y200_xz600_3kp_student_amass_limmt_full_verystiff"
+RUN_NAME="ee_200_3kp_stu"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 TEACHER_RUN_ID="${RUN_NAME}_teacher_${TIMESTAMP}"

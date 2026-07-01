@@ -9,7 +9,7 @@ command:
 
 observation:
   hl_policy:
-    root_and_wrist_6d: {enabled: false}
+    root_and_wrist_6d: {}
     feet_pos_b: {enabled: false}
     root_and_wrist_6d_reference: {}
     ee_compliance_state:
