@@ -1840,14 +1840,20 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
     def get_net_pull_ee_force_b(self):
         return self.net_pull_ee_force_b
 
-    def set_eval_ee_force_b(self, ee_index: int, force_b: torch.Tensor):
+    def set_eval_ee_force_b(self, ee_index: int, force_b: torch.Tensor, env_ids: torch.Tensor | None = None):
         if ee_index < 0 or ee_index >= len(self.net_pull_ee_idx_asset):
             raise ValueError(f"ee_index must be in [0, {len(self.net_pull_ee_idx_asset) - 1}], got {ee_index}.")
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
         if force_b.ndim == 1:
-            force_b = force_b.unsqueeze(0).expand(self.num_envs, -1)
+            force_b = force_b.unsqueeze(0).expand(env_ids.numel(), -1)
         force_b = force_b.to(device=self.device, dtype=torch.float32)
-        if force_b.shape != (self.num_envs, 3):
-            raise ValueError(f"force_b must have shape {(self.num_envs, 3)} or (3,), got {tuple(force_b.shape)}.")
+        if force_b.shape != (env_ids.numel(), 3):
+            raise ValueError(
+                f"force_b must have shape {(env_ids.numel(), 3)} or (3,), got {tuple(force_b.shape)}."
+            )
 
         body_idx = self.net_pull_ee_idx_asset[ee_index]
         matches = (self.net_pull_idx_asset == body_idx).nonzero(as_tuple=False).flatten()
@@ -1856,12 +1862,14 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             raise RuntimeError(f"Eval EE force body {body_name} is not present in net_pull_apply_pattern.")
 
         self.eval_ee_force_enabled = True
-        self.eval_ee_force_body_idx_asset[:] = body_idx
-        self.eval_ee_force_body_local_idx[:] = matches[0]
-        self.eval_ee_force_b[:] = force_b
+        self.eval_ee_force_body_idx_asset[env_ids] = body_idx
+        self.eval_ee_force_body_local_idx[env_ids] = matches[0]
+        self.eval_ee_force_b[env_ids] = force_b
 
     def clear_eval_ee_force(self):
         self.eval_ee_force_enabled = False
+        self.eval_ee_force_body_idx_asset.zero_()
+        self.eval_ee_force_body_local_idx.zero_()
         self.eval_ee_force_b.zero_()
         self.eval_ee_force_w.zero_()
         if hasattr(self, "net_pull_force_w"):

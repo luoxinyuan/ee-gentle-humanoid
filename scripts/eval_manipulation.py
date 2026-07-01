@@ -187,6 +187,15 @@ def _tensor_summary(value: torch.Tensor) -> dict:
     }
 
 
+def _component_summary(values: torch.Tensor) -> dict:
+    values = values.detach().float().cpu()
+    return {
+        "x": _summary(values[..., 0]),
+        "y": _summary(values[..., 1]),
+        "z": _summary(values[..., 2]),
+    }
+
+
 def _get_ee_compliance_eval_info(command_manager, params: dict) -> dict:
     if (
         getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
@@ -239,7 +248,20 @@ def _get_ee_compliance_eval_info(command_manager, params: dict) -> dict:
     }
 
 
-def _compute_ee_compliance_target_b(command_manager, asset, body_ids: list[int], nominal_target_b: torch.Tensor, params: dict):
+def _slice_envs(value: torch.Tensor, env_ids: torch.Tensor | None) -> torch.Tensor:
+    if env_ids is None:
+        return value
+    return value[env_ids]
+
+
+def _compute_ee_compliance_target_b(
+    command_manager,
+    asset,
+    body_ids: list[int],
+    nominal_target_b: torch.Tensor,
+    params: dict,
+    env_ids: torch.Tensor | None = None,
+):
     if (
         getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
         and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
@@ -250,7 +272,11 @@ def _compute_ee_compliance_target_b(command_manager, asset, body_ids: list[int],
         else:
             force_b = torch.zeros_like(nominal_target_b)
         target_offset_b = compliance_target_b - nominal_target_b
-        return compliance_target_b, target_offset_b, force_b
+        return (
+            _slice_envs(compliance_target_b, env_ids),
+            _slice_envs(target_offset_b, env_ids),
+            _slice_envs(force_b, env_ids),
+        )
 
     force_w = torch.zeros_like(nominal_target_b)
     force_apply_idx = getattr(command_manager, "force_apply_idx_asset", None)
@@ -278,7 +304,11 @@ def _compute_ee_compliance_target_b(command_manager, asset, body_ids: list[int],
                     nominal_target_b[:, ee_i],
                 )
         target_offset_b = compliance_target_b - nominal_target_b
-        return compliance_target_b, target_offset_b, force_b
+        return (
+            _slice_envs(compliance_target_b, env_ids),
+            _slice_envs(target_offset_b, env_ids),
+            _slice_envs(force_b, env_ids),
+        )
 
     force_norm = force_b.norm(dim=-1, keepdim=True)
     active_force = torch.where(
@@ -294,7 +324,11 @@ def _compute_ee_compliance_target_b(command_manager, asset, body_ids: list[int],
     else:
         target_offset_b = clamp_norm(target_offset_b, max=float(max_offset.item()))
     compliance_target_b = nominal_target_b + target_offset_b
-    return compliance_target_b, target_offset_b, force_b
+    return (
+        _slice_envs(compliance_target_b, env_ids),
+        _slice_envs(target_offset_b, env_ids),
+        _slice_envs(force_b, env_ids),
+    )
 
 
 def _set_ee_command(command_manager, command: torch.Tensor):
@@ -795,6 +829,17 @@ def evaluate_ee_compliance(cfg, args):
             (name, torch.tensor(vec, dtype=torch.float32, device=base_env.device))
             for name, vec in EE_COMPLIANCE_FORCE_DIRECTIONS
         ]
+        case_specs = []
+        for ee_i, ee_name in enumerate(["left", "right"]):
+            for direction_name, direction_b in directions:
+                for magnitude in EE_COMPLIANCE_FORCE_MAGNITUDES:
+                    case_specs.append({
+                        "ee_i": ee_i,
+                        "ee_name": ee_name,
+                        "direction_name": direction_name,
+                        "direction_b": direction_b,
+                        "force_n": magnitude,
+                    })
         records = []
 
         with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
@@ -832,106 +877,165 @@ def evaluate_ee_compliance(cfg, args):
                 flush=True,
             )
 
-            for ee_i, ee_name in enumerate(["left", "right"]):
-                for direction_name, direction_b in directions:
-                    cfg_stiffness = _stiffness_along_direction(
-                        compliance_eval_info["actual_stiffness"],
-                        direction_b,
-                    )
-                    for magnitude in EE_COMPLIANCE_FORCE_MAGNITUDES:
-                        command_manager.clear_eval_ee_force()
-                        for _ in range(EE_COMPLIANCE_RECOVERY_STEPS):
-                            _, td_ = _rollout_one_step(env, rollout_policy, td_, f"{ee_name} {direction_name} recovery")
+            batch_size = min(max(1, int(getattr(args, "ee_compliance_num_envs", 1))), base_env.num_envs)
+            for batch_start in range(0, len(case_specs), batch_size):
+                batch_cases = case_specs[batch_start: batch_start + batch_size]
+                active_envs = len(batch_cases)
+                env_ids = torch.arange(active_envs, device=base_env.device)
+                command_manager.clear_eval_ee_force()
+                td_ = env.reset()
+                _disable_eval_timer_reset(base_env)
+                _set_static_root_command(command_manager, asset)
+                if _set_default_feet_command(command_manager, asset):
+                    pass
+                _set_ee_eval_target(command_manager, action_manager, default_command)
 
-                        for ramp_step in range(EE_COMPLIANCE_RAMP_STEPS):
-                            force_b = direction_b.unsqueeze(0).expand(base_env.num_envs, -1) * (
-                                magnitude * float(ramp_step + 1) / float(EE_COMPLIANCE_RAMP_STEPS)
-                            )
-                            command_manager.set_eval_ee_force_b(ee_i, force_b)
-                            _, td_ = _rollout_one_step(env, rollout_policy, td_, f"{ee_name} {direction_name} ramp")
+                for _ in range(EE_TRACKING_WARMUP_STEPS):
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance warmup")
 
-                        pos_samples = []
-                        quat_samples = []
-                        compliance_target_samples = []
-                        compliance_offset_samples = []
-                        force_samples = []
-                        full_force_b = direction_b.unsqueeze(0).expand(base_env.num_envs, -1) * magnitude
-                        for hold_step in range(EE_COMPLIANCE_HOLD_STEPS):
-                            command_manager.set_eval_ee_force_b(ee_i, full_force_b)
-                            _, td_ = _rollout_one_step(env, rollout_policy, td_, f"{ee_name} {direction_name} hold")
-                            if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
-                                sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
-                                sample_compliance_target_b, sample_compliance_offset_b, sample_force_b = _compute_ee_compliance_target_b(
-                                    command_manager,
-                                    asset,
-                                    body_ids,
-                                    sample_center_b,
-                                    compliance_params,
-                                )
-                                pos_samples.append(sample_pos_b)
-                                quat_samples.append(sample_quat_b)
-                                compliance_target_samples.append(sample_compliance_target_b)
-                                compliance_offset_samples.append(sample_compliance_offset_b)
-                                force_samples.append(sample_force_b)
-
-                        actual_pos_b, actual_quat_b = _mean_pose_samples(pos_samples, quat_samples)
-                        compliance_target_b = _mean_tensor_samples(compliance_target_samples)
-                        compliance_offset_b = _mean_tensor_samples(compliance_offset_samples)
-                        force_b = _mean_tensor_samples(force_samples)
-                        nominal_error = (actual_pos_b - sample_center_b).norm(dim=-1)
-                        compliance_error = (actual_pos_b - compliance_target_b).norm(dim=-1)
-                        selected_delta_b = actual_pos_b[:, ee_i] - baseline_pos_b[:, ee_i]
-                        selected_along = (selected_delta_b * direction_b).sum(dim=-1)
-                        selected_orth = (selected_delta_b - selected_along.unsqueeze(-1) * direction_b).norm(dim=-1)
-                        along_mean = float(selected_along.mean().item())
-                        measured_stiffness_signed = None
-                        measured_stiffness_abs = None
-                        if abs(along_mean) > 1e-5:
-                            measured_stiffness_signed = float(magnitude / along_mean)
-                            measured_stiffness_abs = float(magnitude / abs(along_mean))
-
-                        rpy_error = torch.rad2deg(_wrap_to_pi(_quat_to_rpy_wxyz(actual_quat_b) - target_rpy_b).abs())
-                        quat_error = _quat_angle_error_deg(actual_quat_b, target_quat_b)
-
-                        records.append({
-                            "ee": ee_name,
-                            "ee_index": ee_i,
-                            "direction": direction_name,
-                            "direction_b": direction_b.detach().cpu().tolist(),
-                            "force_n": magnitude,
-                            "cfg_stiffness_n_per_m": cfg_stiffness,
-                            "measured_stiffness_signed_n_per_m": measured_stiffness_signed,
-                            "measured_stiffness_abs_n_per_m": measured_stiffness_abs,
-                            "deflection_along_m_mean": along_mean,
-                            "deflection_along_m": selected_along.detach().cpu().tolist(),
-                            "deflection_orth_m": selected_orth.detach().cpu().tolist(),
-                            "target_pos_b": sample_center_b.detach().cpu().tolist(),
-                            "baseline_pos_b": baseline_pos_b.detach().cpu().tolist(),
-                            "actual_pos_b": actual_pos_b.detach().cpu().tolist(),
-                            "compliance_target_pos_b": compliance_target_b.detach().cpu().tolist(),
-                            "compliance_offset_b": compliance_offset_b.detach().cpu().tolist(),
-                            "ee_force_b": force_b.detach().cpu().tolist(),
-                            "nominal_pos_error_m": nominal_error.detach().cpu().tolist(),
-                            "compliance_pos_error_m": compliance_error.detach().cpu().tolist(),
-                            "rpy_abs_error_deg": rpy_error.detach().cpu().tolist(),
-                            "quat_angle_error_deg": quat_error.detach().cpu().tolist(),
-                        })
-
-                        print(
-                            f"{ee_name:>5s} {direction_name:>2s} {magnitude:>4.0f}N: "
-                            f"nom_err={nominal_error[:, ee_i].mean().item():.4f} m, "
-                            f"comp_err={compliance_error[:, ee_i].mean().item():.4f} m, "
-                            f"defl={along_mean:.4f} m, "
-                            f"k_meas={measured_stiffness_abs if measured_stiffness_abs is not None else float('nan'):.1f} N/m, "
-                            f"k_cfg={cfg_stiffness if cfg_stiffness is not None else float('nan'):.1f} N/m",
-                            flush=True,
+                baseline_pos_samples = []
+                baseline_quat_samples = []
+                baseline_compliance_target_samples = []
+                for step in range(EE_COMPLIANCE_BASELINE_STEPS):
+                    command_manager.clear_eval_ee_force()
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance baseline")
+                    if step >= EE_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
+                        sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
+                        sample_compliance_target_b, _, _ = _compute_ee_compliance_target_b(
+                            command_manager,
+                            asset,
+                            body_ids,
+                            sample_center_b,
+                            compliance_params,
                         )
+                        baseline_pos_samples.append(sample_pos_b)
+                        baseline_quat_samples.append(sample_quat_b)
+                        baseline_compliance_target_samples.append(sample_compliance_target_b)
+
+                baseline_pos_b, baseline_quat_b = _mean_pose_samples(baseline_pos_samples, baseline_quat_samples)
+                baseline_compliance_target_b = _mean_tensor_samples(baseline_compliance_target_samples)
+                baseline_nominal_error = (baseline_pos_b - sample_center_b).norm(dim=-1)
+                baseline_compliance_error = (baseline_pos_b - baseline_compliance_target_b).norm(dim=-1)
+
+                for _ in range(EE_COMPLIANCE_RECOVERY_STEPS):
+                    command_manager.clear_eval_ee_force()
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance recovery")
+
+                for ramp_step in range(EE_COMPLIANCE_RAMP_STEPS):
+                    ramp_forces = torch.zeros(active_envs, 3, device=base_env.device)
+                    for env_i, case in enumerate(batch_cases):
+                        ramp_forces[env_i] = case["direction_b"] * (
+                            case["force_n"] * float(ramp_step + 1) / float(EE_COMPLIANCE_RAMP_STEPS)
+                        )
+                    for ee_i in (0, 1):
+                        mask = torch.tensor([case["ee_i"] == ee_i for case in batch_cases], device=base_env.device, dtype=torch.bool)
+                        if mask.any():
+                            force_b = ramp_forces[mask]
+                            command_manager.set_eval_ee_force_b(ee_i, force_b, env_ids=env_ids[mask])
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance ramp")
+
+                pos_samples = [[] for _ in range(active_envs)]
+                quat_samples = [[] for _ in range(active_envs)]
+                compliance_target_samples = [[] for _ in range(active_envs)]
+                compliance_offset_samples = [[] for _ in range(active_envs)]
+                force_samples = [[] for _ in range(active_envs)]
+                full_forces = [
+                    case["direction_b"] * case["force_n"]
+                    for case in batch_cases
+                ]
+                for hold_step in range(EE_COMPLIANCE_HOLD_STEPS):
+                    for ee_i in (0, 1):
+                        mask = torch.tensor([case["ee_i"] == ee_i for case in batch_cases], device=base_env.device, dtype=torch.bool)
+                        if mask.any():
+                            force_b = torch.stack([full_forces[i] for i, m in enumerate(mask.tolist()) if m], dim=0)
+                            command_manager.set_eval_ee_force_b(ee_i, force_b, env_ids=env_ids[mask])
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance hold")
+                    if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
+                        sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
+                        for env_i, case in enumerate(batch_cases):
+                            sample_compliance_target_b, sample_compliance_offset_b, sample_force_b = _compute_ee_compliance_target_b(
+                                command_manager,
+                                asset,
+                                body_ids,
+                                sample_center_b,
+                                compliance_params,
+                                env_ids=env_ids[env_i:env_i + 1],
+                            )
+                            pos_samples[env_i].append(sample_pos_b[env_ids[env_i]:env_ids[env_i]+1])
+                            quat_samples[env_i].append(sample_quat_b[env_ids[env_i]:env_ids[env_i]+1])
+                            compliance_target_samples[env_i].append(sample_compliance_target_b)
+                            compliance_offset_samples[env_i].append(sample_compliance_offset_b)
+                            force_samples[env_i].append(sample_force_b)
+
+                for env_i, case in enumerate(batch_cases):
+                    actual_pos_b, actual_quat_b = _mean_pose_samples(pos_samples[env_i], quat_samples[env_i])
+                    compliance_target_b = _mean_tensor_samples(compliance_target_samples[env_i])
+                    compliance_offset_b = _mean_tensor_samples(compliance_offset_samples[env_i])
+                    force_b = _mean_tensor_samples(force_samples[env_i])
+                    nominal_error = (actual_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i]+1]).norm(dim=-1)
+                    compliance_error = (actual_pos_b - compliance_target_b).norm(dim=-1)
+                    nominal_delta_b = actual_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i]+1]
+                    compliance_delta_b = actual_pos_b - compliance_target_b
+                    selected_delta_b = actual_pos_b[:, case["ee_i"]] - baseline_pos_b[env_ids[env_i], case["ee_i"]]
+                    selected_along = (selected_delta_b * case["direction_b"]).sum(dim=-1)
+                    selected_orth = (selected_delta_b - selected_along.unsqueeze(-1) * case["direction_b"]).norm(dim=-1)
+                    along_mean = float(selected_along.mean().item())
+                    measured_stiffness_signed = None
+                    measured_stiffness_abs = None
+                    if abs(along_mean) > 1e-5:
+                        measured_stiffness_signed = float(case["force_n"] / along_mean)
+                        measured_stiffness_abs = float(case["force_n"] / abs(along_mean))
+
+                    rpy_error = torch.rad2deg(_wrap_to_pi(_quat_to_rpy_wxyz(actual_quat_b) - target_rpy_b[env_ids[env_i]:env_ids[env_i]+1]).abs())
+                    quat_error = _quat_angle_error_deg(actual_quat_b, target_quat_b[env_ids[env_i]:env_ids[env_i]+1])
+
+                    records.append({
+                        "ee": case["ee_name"],
+                        "ee_index": case["ee_i"],
+                        "direction": case["direction_name"],
+                        "direction_b": case["direction_b"].detach().cpu().tolist(),
+                        "force_n": case["force_n"],
+                        "cfg_stiffness_n_per_m": _stiffness_along_direction(
+                            compliance_eval_info["actual_stiffness"],
+                            case["direction_b"],
+                        ),
+                        "measured_stiffness_signed_n_per_m": measured_stiffness_signed,
+                        "measured_stiffness_abs_n_per_m": measured_stiffness_abs,
+                        "deflection_along_m_mean": along_mean,
+                        "deflection_along_m": selected_along.detach().cpu().tolist(),
+                        "deflection_orth_m": selected_orth.detach().cpu().tolist(),
+                        "nominal_delta_xyz_m": nominal_delta_b.detach().cpu().tolist(),
+                        "compliance_delta_xyz_m": compliance_delta_b.detach().cpu().tolist(),
+                        "target_pos_b": sample_center_b[env_ids[env_i]].detach().cpu().tolist(),
+                        "baseline_pos_b": baseline_pos_b[env_ids[env_i]].detach().cpu().tolist(),
+                        "actual_pos_b": actual_pos_b.detach().cpu().tolist(),
+                        "compliance_target_pos_b": compliance_target_b.detach().cpu().tolist(),
+                        "compliance_offset_b": compliance_offset_b.detach().cpu().tolist(),
+                        "ee_force_b": force_b.detach().cpu().tolist(),
+                        "nominal_pos_error_m": nominal_error.detach().cpu().tolist(),
+                        "compliance_pos_error_m": compliance_error.detach().cpu().tolist(),
+                        "rpy_abs_error_deg": rpy_error.detach().cpu().tolist(),
+                        "quat_angle_error_deg": quat_error.detach().cpu().tolist(),
+                    })
+
+                    print(
+                        f"{case['ee_name']:>5s} {case['direction_name']:>2s} {case['force_n']:>4.0f}N "
+                        f"[env {batch_start + env_i:02d}]: "
+                        f"nom_err={nominal_error[:, case['ee_i']].mean().item():.4f} m, "
+                        f"comp_err={compliance_error[:, case['ee_i']].mean().item():.4f} m, "
+                        f"defl={along_mean:.4f} m, "
+                        f"k_meas={measured_stiffness_abs if measured_stiffness_abs is not None else float('nan'):.1f} N/m, "
+                        f"k_cfg={records[-1]['cfg_stiffness_n_per_m'] if records[-1]['cfg_stiffness_n_per_m'] is not None else float('nan'):.1f} N/m",
+                        flush=True,
+                    )
 
             command_manager.clear_eval_ee_force()
 
         nominal_errors = torch.tensor([r["nominal_pos_error_m"] for r in records])
         compliance_errors = torch.tensor([r["compliance_pos_error_m"] for r in records])
         deflections = torch.tensor([r["deflection_along_m"] for r in records])
+        nominal_delta_xyz = torch.tensor([r["nominal_delta_xyz_m"] for r in records])
+        compliance_delta_xyz = torch.tensor([r["compliance_delta_xyz_m"] for r in records])
         measured_stiffness = [
             r["measured_stiffness_abs_n_per_m"]
             for r in records
@@ -947,7 +1051,7 @@ def evaluate_ee_compliance(cfg, args):
             "checkpoint": args.checkpoint,
             "run_path": args.run_path,
             "task": args.task,
-            "num_envs": args.num_envs,
+            "num_envs": args.ee_compliance_num_envs if args.ee_compliance_eval else args.num_envs,
             "ee_body_names": body_names,
             "force_directions": EE_COMPLIANCE_FORCE_DIRECTIONS,
             "force_magnitudes_n": EE_COMPLIANCE_FORCE_MAGNITUDES,
@@ -971,11 +1075,13 @@ def evaluate_ee_compliance(cfg, args):
                     "left": _summary(nominal_errors[:, :, 0]),
                     "right": _summary(nominal_errors[:, :, 1]),
                 },
+                "nominal_position_delta_xyz_m": _component_summary(nominal_delta_xyz),
                 "compliance_position_error_m": {
                     "combined": _summary(compliance_errors),
                     "left": _summary(compliance_errors[:, :, 0]),
                     "right": _summary(compliance_errors[:, :, 1]),
                 },
+                "compliance_position_delta_xyz_m": _component_summary(compliance_delta_xyz),
                 "deflection_along_m": _summary(deflections),
                 "measured_stiffness_abs_n_per_m": (
                     _summary(measured_stiffness_tensor)
@@ -1037,6 +1143,8 @@ def main():
                         help="Evaluate EE tracking accuracy with scripted random EE commands")
     parser.add_argument("--ee_compliance_eval", "--ee-compliance-eval", action="store_true", default=False,
                         help="Evaluate EE compliance with deterministic EE force sweeps")
+    parser.add_argument("--ee_compliance_num_envs", type=int, default=1,
+                        help="Number of environments to use for ee_compliance_eval")
     parser.add_argument("--external_force", choices=["on", "off", "default"], default="on",
                         help="External force mode: on uses run cfg, off disables it, default loads the shared eval force cfg")
     parser.add_argument("--ee_output", type=str, default=None, help="Path to write EE tracking JSON report")
@@ -1131,7 +1239,10 @@ def main():
 
     if args.ee_tracking_eval or args.ee_compliance_eval:
         cfg["app"]["headless"] = not args.play
-        cfg["task"]["num_envs"] = args.num_envs
+        if args.ee_compliance_eval:
+            cfg["task"]["num_envs"] = args.ee_compliance_num_envs
+        else:
+            cfg["task"]["num_envs"] = args.num_envs
         cfg["task"]["max_episode_length"] = EE_TRACKING_MAX_EPISODE_LENGTH
         cfg["task"]["termination"] = {}
         cfg["export_policy"] = False
@@ -1165,6 +1276,10 @@ def main():
             cfg["task"]["objects"] = objects_cfg.get("objects", [])
             print(f"  Objects: Loaded {len(cfg['task']['objects'])} objects from {args.objects}")
 
+        if args.ee_compliance_eval:
+            cfg["task"]["objects"] = []
+            print("  Objects: cleared for empty compliance eval scene")
+
     if args.ee_tracking_eval:
         print("\n" + "="*60)
         print("MANIPULATION TASK (EE Tracking Eval)")
@@ -1188,7 +1303,7 @@ def main():
         print("MANIPULATION TASK (EE Compliance Eval)")
         print("="*60)
         print(f"  Run: {args.run_path or args.checkpoint}")
-        print(f"  Num envs: {args.num_envs}")
+        print(f"  Num envs: {args.ee_compliance_num_envs}")
         print(f"  EE bodies: {EE_TRACKING_BODY_NAMES}")
         print(f"  Force directions: {[name for name, _ in EE_COMPLIANCE_FORCE_DIRECTIONS]}")
         print(f"  Force magnitudes: {EE_COMPLIANCE_FORCE_MAGNITUDES} N")
