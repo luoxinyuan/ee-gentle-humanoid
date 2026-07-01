@@ -378,6 +378,36 @@ class prev_high_actions(Observation):
         return sym_utils.SymmetryTransform(perm=torch.arange(dim), signs=torch.ones(dim))
 
 
+class prev_ee_commands(Observation):
+    """History of decoded EE commands sent from the high-level policy to the low-level policy."""
+
+    def __init__(self, env, steps: int=3, flatten: bool=True):
+        super().__init__(env)
+        self.steps = steps
+        self.flatten = flatten
+        self.action_manager = self.env.action_manager
+
+    def compute(self):
+        command_buf = getattr(self.action_manager, "ee_command_buf", None)
+        if command_buf is None:
+            raise RuntimeError("prev_ee_commands requires an action manager with ee_command_buf.")
+        if self.steps > command_buf.shape[1]:
+            raise RuntimeError(
+                f"prev_ee_commands requested {self.steps} steps, but ee_command_buf only stores "
+                f"{command_buf.shape[1]} steps."
+            )
+        command_buf = command_buf[:, :self.steps, :]
+        if self.flatten:
+            return command_buf.reshape(self.num_envs, -1)
+        return command_buf
+
+    def symmetry_transforms(self):
+        if hasattr(self.env.command_manager, "root_and_wrist_6d_sym"):
+            return self.env.command_manager.root_and_wrist_6d_sym().repeat(self.steps)
+        dim = self.action_manager.ee_storage_dim * self.steps
+        return sym_utils.SymmetryTransform(perm=torch.arange(dim), signs=torch.ones(dim))
+
+
 class ee_compliance_state(Observation):
     """Privileged EE state using the same force-over-stiffness target as the reward."""
 

@@ -9,9 +9,10 @@ command:
 
 observation:
   hl_policy:
-    root_and_wrist_6d: {}
+    root_and_wrist_6d: {enabled: false}
     feet_pos_b: {enabled: false}
     root_and_wrist_6d_reference: {}
+    prev_ee_commands: {steps: 3}
     ee_compliance_state:
       enabled: false
       stiffness: ${task.reward.ee_compliance.ee_force_compliance_tracking.stiffness}

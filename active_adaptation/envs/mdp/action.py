@@ -238,6 +238,7 @@ class HierarchicalRootCommand(ActionManager):
         self.high_action_buf = torch.zeros(self.num_envs, 3, self.action_dim, device=self.device)
         self.root_command = torch.zeros(self.num_envs, self.root_storage_dim, device=self.device)
         self.ee_command = torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
+        self.ee_command_buf = torch.zeros(self.num_envs, 3, self.ee_storage_dim, device=self.device)
         self.feet_command = torch.zeros(self.num_envs, self.feet_command_dim, device=self.device)
         self.low_action = torch.zeros(self.num_envs, self.low_action_manager.action_dim, device=self.device)
         self._reset_root_command(torch.arange(self.num_envs, device=self.device))
@@ -314,10 +315,15 @@ class HierarchicalRootCommand(ActionManager):
     def reset(self, env_ids: torch.Tensor):
         self.low_action_manager.reset(env_ids)
         self.high_action_buf[env_ids] = 0.0
+        self.ee_command_buf[env_ids] = 0.0
         self.low_action[env_ids] = 0.0
         self._reset_root_command(env_ids)
         self._reset_ee_command(env_ids)
         self._reset_feet_command(env_ids)
+        if self.ee_command_enabled:
+            self.ee_command_buf[env_ids] = self.ee_command[env_ids].unsqueeze(1).expand(
+                -1, self.ee_command_buf.shape[1], -1
+            )
         if hasattr(self.env.command_manager, "set_root_command"):
             self.env.command_manager.set_root_command(self.root_command)
         if self.ee_command_enabled and hasattr(self.env.command_manager, "set_root_and_wrist_6d_command"):
@@ -383,6 +389,8 @@ class HierarchicalRootCommand(ActionManager):
                 self._set_default_root_command()
             if self.ee_command_enabled:
                 self.ee_command[:] = self._decode_ee_command(raw_action[:, cursor:cursor + self.ee_command_dim])
+                self.ee_command_buf = torch.roll(self.ee_command_buf, shifts=1, dims=1)
+                self.ee_command_buf[:, 0, :] = self.ee_command
                 cursor += self.ee_command_dim
             if self.feet_command_enabled:
                 self.feet_command[:] = self._decode_feet_command(raw_action[:, cursor:cursor + self.feet_command_dim])
