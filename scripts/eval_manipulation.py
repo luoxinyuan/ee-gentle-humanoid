@@ -1046,6 +1046,19 @@ def evaluate_ee_compliance(cfg, args):
             if measured_stiffness
             else torch.empty(0, dtype=torch.float32)
         )
+        measured_stiffness_xyz = {}
+        for axis in ("x", "y", "z"):
+            axis_values = [
+                r["measured_stiffness_abs_n_per_m"]
+                for r in records
+                if r["direction"].endswith(axis) and r["measured_stiffness_abs_n_per_m"] is not None
+            ]
+            axis_tensor = (
+                torch.tensor(axis_values, dtype=torch.float32)
+                if axis_values
+                else torch.empty(0, dtype=torch.float32)
+            )
+            measured_stiffness_xyz[axis] = _summary(axis_tensor) if axis_tensor.numel() > 0 else None
 
         report = {
             "checkpoint": args.checkpoint,
@@ -1088,6 +1101,7 @@ def evaluate_ee_compliance(cfg, args):
                     if measured_stiffness_tensor.numel() > 0
                     else None
                 ),
+                "measured_stiffness_abs_xyz_n_per_m": measured_stiffness_xyz,
             },
             "records": records,
         }
@@ -1102,6 +1116,7 @@ def evaluate_ee_compliance(cfg, args):
         nominal = report["summary"]["nominal_position_error_m"]["combined"]
         compliance = report["summary"]["compliance_position_error_m"]["combined"]
         stiffness_summary = report["summary"]["measured_stiffness_abs_n_per_m"]
+        stiffness_xyz = report["summary"]["measured_stiffness_abs_xyz_n_per_m"]
         print("\n" + "=" * 60)
         print("EE COMPLIANCE EVAL")
         print("=" * 60)
@@ -1114,6 +1129,12 @@ def evaluate_ee_compliance(cfg, args):
             print(
                 "  Measured nominal stiffness abs mean/min/max: "
                 f"{stiffness_summary['mean']:.1f} / {stiffness_summary['min']:.1f} / {stiffness_summary['max']:.1f} N/m"
+            )
+            print(
+                "  Measured nominal stiffness xyz mean/min/max: "
+                f"x={stiffness_xyz['x']['mean']:.1f}/{stiffness_xyz['x']['min']:.1f}/{stiffness_xyz['x']['max']:.1f}, "
+                f"y={stiffness_xyz['y']['mean']:.1f}/{stiffness_xyz['y']['min']:.1f}/{stiffness_xyz['y']['max']:.1f}, "
+                f"z={stiffness_xyz['z']['mean']:.1f}/{stiffness_xyz['z']['min']:.1f}/{stiffness_xyz['z']['max']:.1f} N/m"
             )
         print(f"  Config stiffness: {compliance_eval_info['actual_stiffness']}")
         print(f"  Report: {args.ee_output}")
