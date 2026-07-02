@@ -178,6 +178,38 @@ def _get_ee_compliance_params(cfg) -> dict:
     }
 
 
+def _prompt_low_level_nominal_stiffness(compliance_params: dict, command_manager, action_manager) -> None:
+    if _is_hierarchical_action_manager(action_manager):
+        return
+    default = compliance_params["stiffness"]
+    prompt = (
+        "Low-level policy detected. Enter EE compliance nominal stiffness xyz "
+        f"(default {_format_scalar_or_xyz(default)}), e.g. 600 or 200 600 200: "
+    )
+    try:
+        raw = input(prompt).strip()
+    except EOFError:
+        raw = ""
+    if raw:
+        values = raw.replace(",", " ").split()
+        if len(values) not in (1, 3):
+            raise ValueError(
+                "Expected one stiffness value or three xyz values, for example: 600 or 200 600 200"
+            )
+        compliance_params["stiffness"] = float(values[0]) if len(values) == 1 else [float(v) for v in values]
+        compliance_params["found_in_cfg"] = True
+    if hasattr(command_manager, "net_pull_ee_compliance_stiffness"):
+        command_manager.net_pull_ee_compliance_stiffness = _param_tensor(
+            compliance_params["stiffness"],
+            command_manager.device,
+        )
+    print(
+        "Low-level EE compliance nominal stiffness: "
+        f"{_format_scalar_or_xyz(compliance_params['stiffness'])}",
+        flush=True,
+    )
+
+
 def _tensor_summary(value: torch.Tensor) -> dict:
     value = value.detach().float().reshape(-1).cpu()
     return {
@@ -196,8 +228,10 @@ def _component_summary(values: torch.Tensor) -> dict:
     }
 
 
-def _get_ee_compliance_eval_info(command_manager, params: dict) -> dict:
+def _get_ee_compliance_eval_info(command_manager, params: dict, use_command_manager_target: bool = True) -> dict:
     if (
+        use_command_manager_target
+        and
         getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
         and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
     ):
@@ -261,8 +295,11 @@ def _compute_ee_compliance_target_b(
     nominal_target_b: torch.Tensor,
     params: dict,
     env_ids: torch.Tensor | None = None,
+    use_command_manager_target: bool = True,
 ):
     if (
+        use_command_manager_target
+        and
         getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
         and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
     ):
@@ -278,19 +315,31 @@ def _compute_ee_compliance_target_b(
             _slice_envs(force_b, env_ids),
         )
 
+    if (
+        getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
+        and hasattr(command_manager, "get_net_pull_ee_force_b")
+    ):
+        force_b = command_manager.get_net_pull_ee_force_b()
+        if env_ids is not None and force_b.shape[0] != nominal_target_b.shape[0]:
+            force_b = _slice_envs(force_b, env_ids)
+    else:
+        force_b = None
+
     force_w = torch.zeros_like(nominal_target_b)
     force_apply_idx = getattr(command_manager, "force_apply_idx_asset", None)
     force_applied_w = getattr(command_manager, "force_applied_w", None)
 
-    if force_apply_idx is not None and force_applied_w is not None:
+    if force_b is None and force_apply_idx is not None and force_applied_w is not None:
         force_apply_list = force_apply_idx.detach().cpu().tolist()
         for ee_i, body_i in enumerate(body_ids):
             if body_i in force_apply_list:
                 force_i = force_apply_list.index(body_i)
                 force_w[:, ee_i] = force_applied_w[:, force_i]
 
-    root_quat = asset.data.root_quat_w.unsqueeze(1).expand(-1, len(body_ids), -1)
-    force_b = quat_apply_inverse(root_quat, force_w)
+        root_quat = asset.data.root_quat_w.unsqueeze(1).expand(-1, len(body_ids), -1)
+        force_b = quat_apply_inverse(root_quat, force_w)
+    elif force_b is None:
+        force_b = torch.zeros_like(nominal_target_b)
     if not params["found_in_cfg"] and force_apply_idx is not None and hasattr(command_manager, "force_keypoint_b"):
         compliance_target_b = nominal_target_b.clone()
         force_apply_list = force_apply_idx.detach().cpu().tolist()
@@ -523,7 +572,12 @@ def evaluate_ee_tracking(cfg, args):
         default_pos_b, default_quat_b = _body_pose_in_root_frame(asset, body_ids)
         sample_center_b = _get_ee_sample_center(default_pos_b, base_env.device)
         compliance_params = _get_ee_compliance_params(cfg)
-        compliance_eval_info = _get_ee_compliance_eval_info(command_manager, compliance_params)
+        use_command_manager_compliance_target = _is_hierarchical_action_manager(action_manager)
+        compliance_eval_info = _get_ee_compliance_eval_info(
+            command_manager,
+            compliance_params,
+            use_command_manager_target=use_command_manager_compliance_target,
+        )
         target_quat_b = torch.zeros_like(default_quat_b)
         target_quat_b[..., 0] = 1.0
         target_axis_angle_b = torch.zeros(base_env.num_envs, 2, 3, device=base_env.device)
@@ -614,6 +668,7 @@ def evaluate_ee_tracking(cfg, args):
                     body_ids,
                     target_pos_b[point_idx],
                     compliance_params,
+                    use_command_manager_target=use_command_manager_compliance_target,
                 )
                 compliance_pos_error = (actual_pos_b - compliance_target_b).norm(dim=-1)
                 rpy_error = torch.rad2deg(_wrap_to_pi(_quat_to_rpy_wxyz(actual_quat_b) - target_rpy_b).abs())
@@ -802,7 +857,13 @@ def evaluate_ee_compliance(cfg, args):
         _set_ee_eval_target(command_manager, action_manager, default_command)
 
         compliance_params = _get_ee_compliance_params(cfg)
-        compliance_eval_info = _get_ee_compliance_eval_info(command_manager, compliance_params)
+        _prompt_low_level_nominal_stiffness(compliance_params, command_manager, action_manager)
+        use_command_manager_compliance_target = _is_hierarchical_action_manager(action_manager)
+        compliance_eval_info = _get_ee_compliance_eval_info(
+            command_manager,
+            compliance_params,
+            use_command_manager_target=use_command_manager_compliance_target,
+        )
         mean_window_steps = min(_mean_window_steps(base_env), EE_COMPLIANCE_HOLD_STEPS)
         baseline_window_steps = min(mean_window_steps, EE_COMPLIANCE_BASELINE_STEPS)
 
@@ -861,6 +922,7 @@ def evaluate_ee_compliance(cfg, args):
                         body_ids,
                         sample_center_b,
                         compliance_params,
+                        use_command_manager_target=use_command_manager_compliance_target,
                     )
                     baseline_pos_samples.append(sample_pos_b)
                     baseline_quat_samples.append(sample_quat_b)
@@ -907,6 +969,7 @@ def evaluate_ee_compliance(cfg, args):
                             body_ids,
                             sample_center_b,
                             compliance_params,
+                            use_command_manager_target=use_command_manager_compliance_target,
                         )
                         baseline_pos_samples.append(sample_pos_b)
                         baseline_quat_samples.append(sample_quat_b)
@@ -960,6 +1023,7 @@ def evaluate_ee_compliance(cfg, args):
                                 sample_center_b,
                                 compliance_params,
                                 env_ids=env_ids[env_i:env_i + 1],
+                                use_command_manager_target=use_command_manager_compliance_target,
                             )
                             pos_samples[env_i].append(sample_pos_b[env_ids[env_i]:env_ids[env_i]+1])
                             quat_samples[env_i].append(sample_quat_b[env_ids[env_i]:env_ids[env_i]+1])
