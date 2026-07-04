@@ -4,29 +4,24 @@ set -euo pipefail
 LOW_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid"
 HL_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid_high_level"
 HL_WANDB_PROJECT="gentle_humanoid_high_level"
-CUDA_VISIBLE_DEVICES="0,1,2"
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"
 MASTER_PORT="29501"
-NPROC="3"
-
-TASK="G1/G1_hl_ee_y_compliance_pos_delta_student"
+NPROC="6"
 LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30"
-RUN_NAME="ee_200y_3kp_stu"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-TEACHER_RUN_ID="${RUN_NAME}_teacher_${TIMESTAMP}"
-ADAPT_RUN_ID="${RUN_NAME}_adapt_${TIMESTAMP}"
-FINETUNE_RUN_ID="${RUN_NAME}_finetune_${TIMESTAMP}"
 
 export CUDA_VISIBLE_DEVICES
 
 run_stage() {
-  local algo="$1"
-  local run_id="$2"
-  local total_frames="$3"
-  local checkpoint_path="${4:-}"
+  local task="$1"
+  local algo="$2"
+  local run_id="$3"
+  local total_frames="$4"
+  local checkpoint_path="${5:-}"
 
   local cmd=(torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" scripts/train.py
-    task="$TASK"
+    task="$task"
     algo="$algo"
     total_frames="$total_frames"
     task.action.low_policy.run_path="$LOW_RUN_PATH"
@@ -42,19 +37,34 @@ run_stage() {
   "${cmd[@]}"
 }
 
-run_stage \
-  "root_student_force_ppo" \
-  "$TEACHER_RUN_ID" \
-  "4000_000_000"
+run_pipeline() {
+  local task="$1"
+  local run_name="$2"
 
-run_stage \
-  "root_student_force_ppo_adapt" \
-  "$ADAPT_RUN_ID" \
-  "1000_000_000" \
-  "run:${HL_PROJECT_PATH}/${TEACHER_RUN_ID}"
+  local teacher_run_id="${run_name}_teacher_${TIMESTAMP}"
+  local adapt_run_id="${run_name}_adapt_${TIMESTAMP}"
+  local finetune_run_id="${run_name}_finetune_${TIMESTAMP}"
 
-run_stage \
-  "root_student_force_ppo_finetune" \
-  "$FINETUNE_RUN_ID" \
-  "2000_000_000" \
-  "run:${HL_PROJECT_PATH}/${ADAPT_RUN_ID}"
+  run_stage \
+    "$task" \
+    "root_student_force_ppo" \
+    "$teacher_run_id" \
+    "4000_000_000"
+
+  run_stage \
+    "$task" \
+    "root_student_force_ppo_adapt" \
+    "$adapt_run_id" \
+    "2000_000_000" \
+    "run:${HL_PROJECT_PATH}/${teacher_run_id}"
+
+  run_stage \
+    "$task" \
+    "root_student_force_ppo_finetune" \
+    "$finetune_run_id" \
+    "1000_000_000" \
+    "run:${HL_PROJECT_PATH}/${adapt_run_id}"
+}
+
+run_pipeline "G1/G1_hl_ee_x_compliance_pos_delta_student" "ee_200x_3kp_stu"
+run_pipeline "G1/G1_hl_ee_z_compliance_pos_delta_student" "ee_200z_3kp_stu"
