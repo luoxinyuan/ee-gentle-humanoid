@@ -22,6 +22,7 @@ import os
 import sys
 import json
 import datetime
+import re
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -59,6 +60,21 @@ EE_TRACKING_DEFAULT_EE_CENTER_B = [
 ]
 EE_EVAL_MEAN_WINDOW_SEC = 0.5
 EE_COMPLIANCE_FORCE_MAGNITUDES = [5.0, 10.0, 15.0, 20.0, 30.0]
+
+
+def _safe_report_name(name: str) -> str:
+    name = name.strip().rstrip("/").split("/")[-1]
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name) or "policy"
+
+
+def _default_ee_report_path(args, prefix: str) -> str:
+    if args.run_path:
+        policy_name = _safe_report_name(args.run_path)
+    elif args.checkpoint:
+        policy_name = _safe_report_name(os.path.splitext(os.path.basename(args.checkpoint))[0])
+    else:
+        policy_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join("outputs", f"{prefix}_{policy_name}.json")
 EE_COMPLIANCE_FORCE_DIRECTIONS = [
     ("+x", [1.0, 0.0, 0.0]),
     ("-x", [-1.0, 0.0, 0.0]),
@@ -765,8 +781,7 @@ def evaluate_ee_tracking(cfg, args):
         }
 
         if args.ee_output is None:
-            time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            args.ee_output = os.path.join("outputs", f"ee_tracking_eval_{time_str}.json")
+            args.ee_output = _default_ee_report_path(args, "ee_tracking_eval")
         os.makedirs(os.path.dirname(args.ee_output) or ".", exist_ok=True)
         with open(args.ee_output, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
@@ -1171,8 +1186,7 @@ def evaluate_ee_compliance(cfg, args):
         }
 
         if args.ee_output is None:
-            time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            args.ee_output = os.path.join("outputs", f"ee_compliance_eval_{time_str}.json")
+            args.ee_output = _default_ee_report_path(args, "ee_compliance_eval")
         os.makedirs(os.path.dirname(args.ee_output) or ".", exist_ok=True)
         with open(args.ee_output, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
