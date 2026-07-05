@@ -55,8 +55,8 @@ EE_TRACKING_BODY_NAMES = "left_hand_mimic,right_hand_mimic"
 EE_TRACKING_FEET_BODY_NAMES = "left_ankle_roll_link,right_ankle_roll_link"
 EE_TRACKING_MIN_EE_CENTER_Z = 0.0
 EE_TRACKING_DEFAULT_EE_CENTER_B = [
-    [0.250, 0.180, 0.150],
-    [0.250, -0.180, 0.150],
+    [0.170, 0.250, 0.080],
+    [0.170, -0.250, 0.080],
 ]
 EE_EVAL_MEAN_WINDOW_SEC = 0.5
 EE_COMPLIANCE_FORCE_MAGNITUDES = [5.0, 10.0, 15.0, 20.0, 30.0]

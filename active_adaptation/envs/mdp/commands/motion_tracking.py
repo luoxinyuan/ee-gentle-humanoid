@@ -243,7 +243,9 @@ class MotionTrackingCommand(Command):
                 reward_sigma: dict[str, list[float]] = {},
                 student_train: bool = False,
                 disable_motion_finish: bool = False,
-                teleop: dict | None = None,):
+                teleop: dict | None = None,
+                synthetic_ee_target: dict | None = None,
+                motion_ee_coverage_resample: dict | None = None,):
         super().__init__(env)
         
         # Lists for logging UDP target and actual EE position/pose
@@ -263,6 +265,42 @@ class MotionTrackingCommand(Command):
         self.root_and_wrist_6d_command = torch.zeros(self.num_envs, 12, device=self.device)
         self.use_root_and_wrist_6d_reference_override = False
         self.root_and_wrist_6d_reference_override = torch.zeros(self.num_envs, 12, device=self.device)
+        synthetic_ee_target = synthetic_ee_target or {}
+        self.synthetic_ee_target_enabled = bool(synthetic_ee_target.get("enabled", False))
+        self.synthetic_ee_target_prob = float(synthetic_ee_target.get("prob", 0.0))
+        self.synthetic_ee_target_train_only = bool(synthetic_ee_target.get("train_only", True))
+        self.synthetic_ee_target_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.synthetic_ee_target_pos_b = torch.zeros(self.num_envs, 2, 3, dtype=torch.float32, device=self.device)
+        self.synthetic_ee_target_left_range = self._parse_synthetic_ee_range(
+            synthetic_ee_target.get("left_range", [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+            name="synthetic_ee_target.left_range",
+        )
+        self.synthetic_ee_target_right_range = self._parse_synthetic_ee_range(
+            synthetic_ee_target.get("right_range", [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+            name="synthetic_ee_target.right_range",
+        )
+        if not 0.0 <= self.synthetic_ee_target_prob <= 1.0:
+            raise ValueError(f"synthetic_ee_target.prob must be in [0, 1], got {self.synthetic_ee_target_prob}.")
+        motion_ee_coverage_resample = motion_ee_coverage_resample or {}
+        self.motion_ee_coverage_resample_enabled = bool(motion_ee_coverage_resample.get("enabled", False))
+        self.motion_ee_coverage_train_only = bool(motion_ee_coverage_resample.get("train_only", True))
+        self.motion_ee_coverage_candidates = int(motion_ee_coverage_resample.get("candidates", 32))
+        self.motion_ee_coverage_bins = int(motion_ee_coverage_resample.get("bins", 16))
+        self.motion_ee_coverage_power = float(motion_ee_coverage_resample.get("power", 0.5))
+        self.motion_ee_coverage_left_range = self._parse_synthetic_ee_range(
+            motion_ee_coverage_resample.get("left_range", self.synthetic_ee_target_left_range),
+            name="motion_ee_coverage_resample.left_range",
+        )
+        self.motion_ee_coverage_right_range = self._parse_synthetic_ee_range(
+            motion_ee_coverage_resample.get("right_range", self.synthetic_ee_target_right_range),
+            name="motion_ee_coverage_resample.right_range",
+        )
+        if self.motion_ee_coverage_candidates <= 0:
+            raise ValueError("motion_ee_coverage_resample.candidates must be positive.")
+        if self.motion_ee_coverage_bins <= 1:
+            raise ValueError("motion_ee_coverage_resample.bins must be > 1.")
+        if self.motion_ee_coverage_power < 0.0:
+            raise ValueError("motion_ee_coverage_resample.power must be non-negative.")
         self.use_feet_pos_b_command = False
         self.feet_pos_b_command = torch.zeros(self.num_envs, 6, device=self.device)
         self.use_command_override = False
@@ -284,6 +322,7 @@ class MotionTrackingCommand(Command):
 
         self.dataset = ProgressiveMultiMotionDataset(**dataset, env_size=self.num_envs, max_step_size=1000, dataset_extra_keys=dataset_extra_keys, device=self.device, ds_device=torch.device("cpu"), refresh_threshold=1000 * 20)
         self.dataset.set_limit(self.asset.data.soft_joint_pos_limits, self.asset.data.soft_joint_vel_limits, self.asset.joint_names)
+        self._configure_motion_ee_coverage_resampling()
 
         # bodies for full‑body keypoint tracking
         self.keypoint_patterns = keypoint_patterns
@@ -411,6 +450,145 @@ class MotionTrackingCommand(Command):
         ## reward sigma
         self.reward_sigma = reward_sigma
 
+    def _synthetic_ee_target_active(self) -> bool:
+        if not self.synthetic_ee_target_enabled:
+            return False
+        if self.synthetic_ee_target_train_only and not getattr(self.env, "training", True):
+            return False
+        return True
+
+    def _motion_ee_coverage_active(self) -> bool:
+        if not self.motion_ee_coverage_resample_enabled:
+            return False
+        if self.motion_ee_coverage_train_only and not getattr(self.env, "training", True):
+            return False
+        return True
+
+    def _parse_synthetic_ee_range(self, value, *, name: str) -> torch.Tensor:
+        value = torch.as_tensor(value, dtype=torch.float32, device=self.device)
+        if value.shape != (2, 3):
+            raise ValueError(f"{name} must have shape [2, 3] as [min_xyz, max_xyz], got {tuple(value.shape)}.")
+        if torch.any(value[1] < value[0]):
+            raise ValueError(f"{name} max must be >= min, got {value}.")
+        return value
+
+    def _sample_synthetic_ee_target(self, env_ids: torch.Tensor):
+        if not self._synthetic_ee_target_active():
+            self.synthetic_ee_target_mask[env_ids] = False
+            return
+        use_synth = torch.rand(env_ids.shape[0], device=self.device) < self.synthetic_ee_target_prob
+        self.synthetic_ee_target_mask[env_ids] = use_synth
+        if not use_synth.any():
+            return
+        synth_env_ids = env_ids[use_synth]
+
+        def sample_range(target_range: torch.Tensor, count: int) -> torch.Tensor:
+            low = target_range[0].view(1, 3)
+            high = target_range[1].view(1, 3)
+            return low + torch.rand(count, 3, device=self.device) * (high - low)
+
+        self.synthetic_ee_target_pos_b[synth_env_ids, 0] = sample_range(
+            self.synthetic_ee_target_left_range,
+            synth_env_ids.numel(),
+        )
+        self.synthetic_ee_target_pos_b[synth_env_ids, 1] = sample_range(
+            self.synthetic_ee_target_right_range,
+            synth_env_ids.numel(),
+        )
+
+    def _configure_motion_ee_coverage_resampling(self):
+        self.motion_ee_coverage_hist = None
+        if not self.motion_ee_coverage_resample_enabled:
+            return
+        ee_names = ["left_hand_mimic", "right_hand_mimic"]
+        self.motion_ee_coverage_idx_motion = torch.tensor(
+            [self.dataset.body_names.index(name) for name in ee_names],
+            dtype=torch.long,
+            device=self.device,
+        )
+        ranges = torch.stack([
+            self.motion_ee_coverage_left_range,
+            self.motion_ee_coverage_right_range,
+        ]).cpu()
+        bins = self.motion_ee_coverage_bins
+        hist = torch.zeros(2, bins, bins, bins, dtype=torch.float32)
+        for ds in self.dataset.datasets:
+            body_ids_cpu = [ds.body_names.index(name) for name in ee_names]
+            for start in range(0, ds.num_steps, 250_000):
+                end = min(start + 250_000, ds.num_steps)
+                pos = ds.data.body_pos_b[start:end, body_ids_cpu, :].to(torch.float32).cpu()
+                for ee_i in range(2):
+                    lo = ranges[ee_i, 0]
+                    hi = ranges[ee_i, 1]
+                    valid = ((pos[:, ee_i] >= lo) & (pos[:, ee_i] <= hi)).all(dim=-1)
+                    if not valid.any():
+                        continue
+                    idx = ((pos[valid, ee_i] - lo) / (hi - lo).clamp_min(1e-6) * bins).floor().long()
+                    idx = idx.clamp(0, bins - 1)
+                    flat = idx[:, 0] * bins * bins + idx[:, 1] * bins + idx[:, 2]
+                    hist[ee_i].view(-1).index_add_(0, flat, torch.ones_like(flat, dtype=torch.float32))
+        self.motion_ee_coverage_hist = hist.to(self.device)
+        occupied = (hist > 0).float().mean(dim=(1, 2, 3))
+        print(
+            "[MotionTrackingCommand] motion EE coverage resampling enabled: "
+            f"candidates={self.motion_ee_coverage_candidates}, bins={bins}, "
+            f"power={self.motion_ee_coverage_power}, occupied={occupied.tolist()}",
+            flush=True,
+        )
+
+    def _motion_ee_coverage_density(self, pos_b: torch.Tensor) -> torch.Tensor:
+        ranges = torch.stack([
+            self.motion_ee_coverage_left_range,
+            self.motion_ee_coverage_right_range,
+        ])
+        bins = self.motion_ee_coverage_bins
+        density = torch.zeros(pos_b.shape[:-2], dtype=torch.float32, device=self.device)
+        for ee_i in range(2):
+            lo = ranges[ee_i, 0]
+            hi = ranges[ee_i, 1]
+            valid = ((pos_b[..., ee_i, :] >= lo) & (pos_b[..., ee_i, :] <= hi)).all(dim=-1)
+            idx = ((pos_b[..., ee_i, :] - lo) / (hi - lo).clamp_min(1e-6) * bins).floor().long()
+            idx = idx.clamp(0, bins - 1)
+            counts = self.motion_ee_coverage_hist[
+                ee_i,
+                idx[..., 0],
+                idx[..., 1],
+                idx[..., 2],
+            ]
+            density = density + torch.where(valid, counts, counts.new_full(counts.shape, counts.max() + 1.0))
+        return density
+
+    def _sample_coverage_start_offsets(self, env_ids: torch.Tensor, max_start: torch.Tensor) -> torch.Tensor:
+        count = env_ids.numel()
+        candidates = self.motion_ee_coverage_candidates
+        max_start = max_start.clamp_min(1)
+        candidate_t = (
+            torch.rand(count, candidates, device=self.device)
+            * max_start.to(torch.float32).unsqueeze(1)
+        ).floor().to(torch.int32)
+        env_ids_flat = env_ids.repeat_interleave(candidates)
+        candidate_motion = self.dataset.get_slice(
+            env_ids_flat,
+            candidate_t.reshape(-1),
+            steps=1,
+        )
+        candidate_pos = candidate_motion.body_pos_b[:, 0, self.motion_ee_coverage_idx_motion, :]
+        candidate_pos = candidate_pos.reshape(count, candidates, 2, 3)
+        density = self._motion_ee_coverage_density(candidate_pos)
+        weights = (density + 1.0).pow(-self.motion_ee_coverage_power)
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        selected = torch.multinomial(weights, num_samples=1).squeeze(1)
+        return candidate_t[torch.arange(count, device=self.device), selected]
+
+    def _apply_synthetic_ee_target(self, reference: torch.Tensor) -> torch.Tensor:
+        if not self._synthetic_ee_target_active() or not self.synthetic_ee_target_mask.any():
+            return reference
+        reference = reference.clone()
+        reference[self.synthetic_ee_target_mask, :6] = self.synthetic_ee_target_pos_b[
+            self.synthetic_ee_target_mask
+        ].reshape(-1, 6)
+        return reference
+
     def sample_init(self, env_ids: torch.Tensor):
         t = self.t[env_ids]
         lengths = self.lengths[env_ids]
@@ -419,12 +597,17 @@ class MotionTrackingCommand(Command):
         lengths = self.dataset.reset(env_ids)
         
         max_start = lengths - self.future_steps[-1] - 1
-        rand_float = torch.rand(env_ids.shape[0], device=env_ids.device) * 0.75  # [0,0.75)
-        offsets = (rand_float * max_start.to(torch.float32)).floor().int()
-        t[:] = offsets * (torch.rand(env_ids.shape[0], device=env_ids.device) > self.zero_init_prob)
+        if self._motion_ee_coverage_active():
+            offsets = self._sample_coverage_start_offsets(env_ids, max_start)
+            t[:] = offsets
+        else:
+            rand_float = torch.rand(env_ids.shape[0], device=env_ids.device) * 0.75  # [0,0.75)
+            offsets = (rand_float * max_start.to(torch.float32)).floor().int()
+            t[:] = offsets * (torch.rand(env_ids.shape[0], device=env_ids.device) > self.zero_init_prob)
 
         self.lengths[env_ids] = lengths
         self.t[env_ids] = t
+        self._sample_synthetic_ee_target(env_ids)
 
         motion = self.dataset.get_slice(env_ids, self.t[env_ids], 1)
 
@@ -760,7 +943,7 @@ class MotionTrackingCommand(Command):
             return self.root_and_wrist_6d_reference_override
         if self.teleop_obs_source == "udp":
             return self._root_and_wrist_6d_from_udp()
-        return self._root_and_wrist_6d_from_motion()
+        return self._apply_synthetic_ee_target(self._root_and_wrist_6d_from_motion())
 
     def set_root_and_wrist_6d_reference_override(self, command: torch.Tensor):
         if command.shape[-1] != 12:
@@ -1451,6 +1634,11 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_curriculum_end: float = 0.6,
         net_pull_zero_prob_start: float = 0.85,
         net_pull_force_scale_start: float = 0.25,
+        net_pull_margin_aware: bool = False,
+        net_pull_margin_min_force: float = 5.0,
+        net_pull_margin_safety: float = 0.9,
+        net_pull_margin_left_range: Sequence[Sequence[float]] | None = None,
+        net_pull_margin_right_range: Sequence[Sequence[float]] | None = None,
         net_pull_ee_compliance_stiffness: float = 200.0,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
@@ -1644,6 +1832,17 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.net_pull_zero_prob_start = float(net_pull_zero_prob_start)
         self.net_pull_force_scale_start = float(net_pull_force_scale_start)
         self.net_pull_force_scale = 1.0
+        self.net_pull_margin_aware = bool(net_pull_margin_aware)
+        self.net_pull_margin_min_force = float(net_pull_margin_min_force)
+        self.net_pull_margin_safety = float(net_pull_margin_safety)
+        self.net_pull_margin_left_range = self._parse_synthetic_ee_range(
+            net_pull_margin_left_range or [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]],
+            name="net_pull_margin_left_range",
+        )
+        self.net_pull_margin_right_range = self._parse_synthetic_ee_range(
+            net_pull_margin_right_range or [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]],
+            name="net_pull_margin_right_range",
+        )
         if not 0.0 <= self.net_pull_zero_prob_target <= 1.0:
             raise ValueError(f"net_pull_zero_prob must be in [0, 1], got {self.net_pull_zero_prob_target}.")
         if self.net_pull_curriculum_end <= 0.0:
@@ -1652,6 +1851,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             raise ValueError(f"net_pull_zero_prob_start must be in [0, 1], got {self.net_pull_zero_prob_start}.")
         if not 0.0 <= self.net_pull_force_scale_start <= 1.0:
             raise ValueError(f"net_pull_force_scale_start must be in [0, 1], got {self.net_pull_force_scale_start}.")
+        if self.net_pull_margin_min_force < 0.0:
+            raise ValueError("net_pull_margin_min_force must be non-negative.")
+        if not 0.0 < self.net_pull_margin_safety <= 1.0:
+            raise ValueError("net_pull_margin_safety must be in (0, 1].")
         (
             self.net_pull_ee_compliance_stiffness,
             stiffness_directional,
@@ -1998,6 +2201,59 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             return direction
         return normalize(rand_points_isotropic(count, 1, r_max=1.0, device=self.device).squeeze(1))
 
+    def _net_pull_margin_force_limit(self, env_ids: torch.Tensor) -> torch.Tensor:
+        if not self.net_pull_margin_aware:
+            return torch.full((env_ids.numel(), 1), self.net_pull_force_range[1], device=self.device)
+        if not hasattr(self, "net_pull_ee_idx_asset"):
+            return torch.full((env_ids.numel(), 1), self.net_pull_force_range[1], device=self.device)
+
+        body_idx = self.net_pull_idx_asset[self.net_pull_body_local_idx[env_ids]]
+        ee_match = body_idx.unsqueeze(1) == self.net_pull_ee_idx_asset.unsqueeze(0)
+        is_ee = ee_match.any(dim=1)
+        limits = torch.full((env_ids.numel(), 1), self.net_pull_force_range[1], device=self.device)
+        if not is_ee.any():
+            return limits
+
+        local_ids = torch.arange(env_ids.numel(), device=self.device)[is_ee]
+        ee_ids = ee_match[is_ee].int().argmax(dim=1)
+        active_env_ids = env_ids[is_ee]
+        nominal_target_b = self._net_pull_ee_nominal_from_motion()[active_env_ids, ee_ids]
+        force_dir_b = quat_apply_inverse(
+            self.asset.data.root_quat_w[active_env_ids],
+            self.net_pull_force_dir_w[active_env_ids],
+        )
+
+        ranges = torch.stack([
+            self.net_pull_margin_left_range,
+            self.net_pull_margin_right_range,
+        ])
+        low = ranges[ee_ids, 0]
+        high = ranges[ee_ids, 1]
+        stiffness = self.net_pull_ee_compliance_stiffness
+        if stiffness.ndim == 0:
+            stiffness_xyz = torch.full_like(force_dir_b, float(stiffness.item()))
+        else:
+            stiffness_xyz = stiffness.reshape(1, 3).expand_as(force_dir_b)
+
+        eps = 1e-6
+        positive = force_dir_b > eps
+        negative = force_dir_b < -eps
+        axis_limit = torch.full_like(force_dir_b, float("inf"))
+        axis_limit = torch.where(
+            positive,
+            ((high - nominal_target_b).clamp_min(0.0) * stiffness_xyz / force_dir_b.clamp_min(eps)),
+            axis_limit,
+        )
+        axis_limit = torch.where(
+            negative,
+            ((nominal_target_b - low).clamp_min(0.0) * stiffness_xyz / (-force_dir_b).clamp_min(eps)),
+            axis_limit,
+        )
+        force_limit = axis_limit.min(dim=-1, keepdim=True).values
+        force_limit = torch.where(torch.isfinite(force_limit), force_limit, limits[local_ids])
+        limits[local_ids] = force_limit.clamp_min(0.0) * self.net_pull_margin_safety
+        return limits
+
     def net_pull_schedule(self):
         self.net_pull_phase_timer -= 1
         phase_done = self.net_pull_phase_timer < 0
@@ -2035,14 +2291,32 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                     self.net_pull_force_range[1],
                     self.device,
                 ) * self.net_pull_force_scale
-                ramp_steps = random_uniform(
-                    active_envs.numel(),
-                    self.net_pull_ramp_up_range[0],
-                    self.net_pull_ramp_up_range[1],
-                    self.device,
-                ).int()
-                self.net_pull_phase_timer[active_envs] = ramp_steps
-                self.net_pull_force_tl.set(active_envs, end=force_mag, total_steps=ramp_steps)
+                if self.net_pull_margin_aware:
+                    force_limit = self._net_pull_margin_force_limit(active_envs)
+                    feasible = force_limit >= self.net_pull_margin_min_force
+                    force_mag = torch.minimum(force_mag, force_limit)
+                    infeasible_envs = active_envs[~feasible.squeeze(-1)]
+                    if infeasible_envs.numel() > 0:
+                        self.net_pull_phase[infeasible_envs] = 0
+                        self.net_pull_force_dir_w[infeasible_envs] = 0.0
+                        self.net_pull_force_tl.set(infeasible_envs, end=0.0, total_steps=1)
+                        self.net_pull_phase_timer[infeasible_envs] = random_uniform(
+                            infeasible_envs.numel(),
+                            self.net_pull_rest_range[0],
+                            self.net_pull_rest_range[1],
+                            self.device,
+                        ).int()
+                    active_envs = active_envs[feasible.squeeze(-1)]
+                    force_mag = force_mag[feasible.squeeze(-1)]
+                if active_envs.numel() > 0:
+                    ramp_steps = random_uniform(
+                        active_envs.numel(),
+                        self.net_pull_ramp_up_range[0],
+                        self.net_pull_ramp_up_range[1],
+                        self.device,
+                    ).int()
+                    self.net_pull_phase_timer[active_envs] = ramp_steps
+                    self.net_pull_force_tl.set(active_envs, end=force_mag, total_steps=ramp_steps)
 
         ramp_up_envs = env_ids[phase_at_done == 1]
         if ramp_up_envs.numel() > 0:
@@ -2910,7 +3184,7 @@ class RootCommandMotionTrackingCommand_impedance(MotionTrackingCommand_impedance
             return self.root_and_wrist_6d_reference_override
         if self.teleop_obs_source == "udp":
             return self._root_and_wrist_6d_from_udp()
-        return self._root_and_wrist_6d_from_motion()
+        return self._apply_synthetic_ee_target(self._root_and_wrist_6d_from_motion())
 
     def set_root_and_wrist_6d_command(self, command: torch.Tensor):
         if command.shape[-1] != 12:
