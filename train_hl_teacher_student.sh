@@ -58,4 +58,6 @@ run_pipeline() {
     "run:${HL_PROJECT_PATH}/${teacher_run_id}"
 }
 
-run_pipeline "G1/G1_hl_ee_compliance_pos_delta_student" "ee_200_3kp_margin_stu"
+run_pipeline "G1/G1_hl_ee_x_compliance_pos_delta_student" "ee_200x_3kp_margin_stu"
+run_pipeline "G1/G1_hl_ee_z_compliance_pos_delta_student" "ee_200z_3kp_margin_stu"
+run_pipeline "G1/G1_hl_ee_y_compliance_pos_delta_student" "ee_200y_3kp_margin_stu"

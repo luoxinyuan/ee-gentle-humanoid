@@ -34,10 +34,12 @@ from scripts.utils.play import play
 from scripts.utils.helpers import make_env_policy
 from active_adaptation.utils.math import (
     clamp_norm,
+    quat_apply,
     quat_apply_inverse,
     quat_mul,
     quat_conjugate,
     axis_angle_from_quat,
+    yaw_quat,
     normalize,
 )
 
@@ -87,6 +89,22 @@ EE_COMPLIANCE_RAMP_STEPS = 25
 EE_COMPLIANCE_HOLD_STEPS = 100
 EE_COMPLIANCE_RECOVERY_STEPS = 50
 EE_COMPLIANCE_BASELINE_STEPS = 50
+ROOT_COMPLIANCE_BODY_NAMES = [
+    "torso_link",
+    "left_shoulder_yaw_link",
+    "right_shoulder_yaw_link",
+    "left_wrist_roll_link",
+    "right_wrist_roll_link",
+    "left_hand_mimic",
+    "right_hand_mimic",
+]
+ROOT_COMPLIANCE_FORCE_DIRECTIONS = [
+    ("+x", [1.0, 0.0, 0.0]),
+    ("-x", [-1.0, 0.0, 0.0]),
+    ("+y", [0.0, 1.0, 0.0]),
+    ("-y", [0.0, -1.0, 0.0]),
+]
+ROOT_COMPLIANCE_FORCE_MAGNITUDES = [5.0, 10.0, 20.0, 30.0]
 
 
 def _sample_uniform_ball(num_points: int, radius: float, seed: int) -> torch.Tensor:
@@ -559,7 +577,7 @@ def _disable_eval_timer_reset(base_env):
 
 def _warn_if_done(tensordict, step_label: str):
     if "done" in tensordict.keys() and tensordict["done"].any():
-        print(f"[WARNING] Env reset triggered during EE tracking eval at {step_label}.", flush=True)
+        print(f"[WARNING] Env reset triggered during scripted eval at {step_label}.", flush=True)
 
 
 def evaluate_ee_tracking(cfg, args):
@@ -830,6 +848,406 @@ def _rollout_one_step(env, rollout_policy, td_, step_label: str):
     td, td_ = env.step_and_maybe_reset(td_)
     _warn_if_done(td, step_label)
     return td, td_
+
+
+def _get_root_compliance_params(cfg) -> dict:
+    reward_cfg = OmegaConf.select(cfg, "task.reward.root_hold.root_force_velocity_tracking")
+    found = reward_cfg is not None
+    reward_cfg = reward_cfg or {}
+    return {
+        "found_in_cfg": found,
+        "damping": float(reward_cfg.get("damping", 60.0)),
+        "force_deadband": float(reward_cfg.get("force_deadband", 0.0)),
+        "max_speed": reward_cfg.get("max_speed", None),
+        "add_root_command_reference": bool(reward_cfg.get("add_root_command_reference", True)),
+    }
+
+
+def _velocity_xy_b_to_w(asset, velocity_xy_b: torch.Tensor) -> torch.Tensor:
+    velocity_b = torch.zeros(velocity_xy_b.shape[0], 3, dtype=torch.float32, device=velocity_xy_b.device)
+    velocity_b[:, :2] = velocity_xy_b
+    return quat_apply(yaw_quat(asset.data.root_quat_w), velocity_b)[:, :2]
+
+
+def _get_root_reference_velocity_w(command_manager, asset, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+    if hasattr(command_manager, "get_root_command_reference"):
+        root_reference = command_manager.get_root_command_reference()
+    elif hasattr(command_manager, "root_command"):
+        root_reference = command_manager.root_command
+    else:
+        root_reference = torch.zeros(asset.data.root_pos_w.shape[0], 5, device=asset.data.root_pos_w.device)
+    velocity_w = _velocity_xy_b_to_w(asset, root_reference[:, 1:3])
+    return _slice_envs(velocity_w, env_ids)
+
+
+def _get_root_command_velocity_w(action_manager, command_manager, asset, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+    root_command = getattr(action_manager, "root_command", None)
+    if root_command is None:
+        root_command = getattr(command_manager, "root_command", None)
+    if root_command is None:
+        return _get_root_reference_velocity_w(command_manager, asset, env_ids)
+    velocity_w = _velocity_xy_b_to_w(asset, root_command[:, 1:3])
+    return _slice_envs(velocity_w, env_ids)
+
+
+def _get_root_eval_sample(command_manager, action_manager, asset, env_ids: torch.Tensor | None = None) -> dict:
+    root_rpy_w = _quat_to_rpy_wxyz(asset.data.root_quat_w)
+    return {
+        "reference_velocity_w": _get_root_reference_velocity_w(command_manager, asset, env_ids),
+        "command_velocity_w": _get_root_command_velocity_w(action_manager, command_manager, asset, env_ids),
+        "actual_velocity_w": _slice_envs(asset.data.root_lin_vel_w[:, :2], env_ids),
+        "root_height": _slice_envs(asset.data.root_pos_w[:, 2:3], env_ids),
+        "root_yaw": _slice_envs(root_rpy_w[:, 2:3], env_ids),
+    }
+
+
+def _mean_sample_dict(samples: list[dict]) -> dict:
+    return {
+        key: _mean_tensor_samples([sample[key] for sample in samples])
+        for key in samples[0].keys()
+    }
+
+
+def _safe_ratio(force_n: float, velocity_mps: float) -> float | None:
+    if abs(velocity_mps) <= 1e-5:
+        return None
+    return float(force_n / velocity_mps)
+
+
+def _available_root_eval_bodies(command_manager, asset) -> list[str]:
+    available = []
+    net_pull_idx_asset = getattr(command_manager, "net_pull_idx_asset", None)
+    if net_pull_idx_asset is None:
+        return available
+    net_pull_ids = set(int(idx) for idx in net_pull_idx_asset.detach().cpu().tolist())
+    for body_name in ROOT_COMPLIANCE_BODY_NAMES:
+        if body_name not in asset.body_names:
+            continue
+        if asset.body_names.index(body_name) not in net_pull_ids:
+            continue
+        available.append(body_name)
+    return available
+
+
+def evaluate_root_compliance(cfg, args):
+    OmegaConf.resolve(cfg)
+    OmegaConf.set_struct(cfg, False)
+
+    app_launcher = AppLauncher(cfg.app)
+    simulation_app = app_launcher.app
+    env = None
+
+    try:
+        env, policy, _vecnorm, _ = make_env_policy(cfg)
+        rollout_policy = policy.get_rollout_policy("eval")
+        base_env = env.base_env if hasattr(env, "base_env") else env
+        asset = base_env.scene["robot"]
+        command_manager = base_env.command_manager
+        action_manager = base_env.action_manager
+        _set_external_force(command_manager, True)
+
+        if not hasattr(command_manager, "set_eval_root_force_w") or not hasattr(command_manager, "clear_eval_root_force"):
+            raise RuntimeError(
+                "Root compliance eval needs MotionTrackingCommand_impedance with set_eval_root_force_w() "
+                "and clear_eval_root_force()."
+            )
+
+        body_names = _available_root_eval_bodies(command_manager, asset)
+        if not body_names:
+            raise RuntimeError(
+                "No root compliance eval bodies are present in net_pull_apply_pattern. "
+                f"Requested candidates: {ROOT_COMPLIANCE_BODY_NAMES}"
+            )
+
+        root_params = _get_root_compliance_params(cfg)
+        damping = float(root_params["damping"])
+        mean_window_steps = min(_mean_window_steps(base_env), EE_COMPLIANCE_HOLD_STEPS)
+        baseline_window_steps = min(mean_window_steps, EE_COMPLIANCE_BASELINE_STEPS)
+
+        td_ = env.reset()
+        _disable_eval_timer_reset(base_env)
+        _set_static_root_command(command_manager, asset)
+        print("Static root command enabled for root compliance eval: reference velocity = 0.", flush=True)
+        print(
+            "Root compliance target: "
+            f"delta_v_w = force_xy_w / damping, damping={damping:.2f} N/(m/s), "
+            f"force_deadband={root_params['force_deadband']:.2f} N, "
+            f"max_speed={root_params['max_speed']}",
+            flush=True,
+        )
+        print(
+            f"Starting root compliance sweep... bodies={body_names}, "
+            f"mean_window_steps={mean_window_steps}, baseline_window_steps={baseline_window_steps}",
+            flush=True,
+        )
+
+        directions = [
+            (name, torch.tensor(vec, dtype=torch.float32, device=base_env.device))
+            for name, vec in ROOT_COMPLIANCE_FORCE_DIRECTIONS
+        ]
+        case_specs = []
+        for body_name in body_names:
+            for direction_name, direction_w in directions:
+                for magnitude in ROOT_COMPLIANCE_FORCE_MAGNITUDES:
+                    case_specs.append({
+                        "body_name": body_name,
+                        "direction_name": direction_name,
+                        "direction_w": direction_w,
+                        "force_n": magnitude,
+                    })
+
+        records = []
+        batch_size = min(max(1, int(getattr(args, "root_compliance_num_envs", 1))), base_env.num_envs)
+
+        with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
+            for batch_start in range(0, len(case_specs), batch_size):
+                batch_cases = case_specs[batch_start: batch_start + batch_size]
+                active_envs = len(batch_cases)
+                env_ids = torch.arange(active_envs, device=base_env.device)
+                command_manager.clear_eval_root_force()
+                td_ = env.reset()
+                _disable_eval_timer_reset(base_env)
+                _set_static_root_command(command_manager, asset)
+
+                for _ in range(EE_TRACKING_WARMUP_STEPS):
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance warmup")
+
+                baseline_samples = []
+                for step in range(EE_COMPLIANCE_BASELINE_STEPS):
+                    command_manager.clear_eval_root_force()
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance baseline")
+                    if step >= EE_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
+                        baseline_samples.append(
+                            _get_root_eval_sample(command_manager, action_manager, asset, env_ids=env_ids)
+                        )
+                baseline = _mean_sample_dict(baseline_samples)
+
+                for _ in range(EE_COMPLIANCE_RECOVERY_STEPS):
+                    command_manager.clear_eval_root_force()
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance recovery")
+
+                for ramp_step in range(EE_COMPLIANCE_RAMP_STEPS):
+                    ramp_ratio = float(ramp_step + 1) / float(EE_COMPLIANCE_RAMP_STEPS)
+                    for env_i, case in enumerate(batch_cases):
+                        force_w = case["direction_w"] * (case["force_n"] * ramp_ratio)
+                        command_manager.set_eval_root_force_w(
+                            case["body_name"],
+                            force_w,
+                            env_ids=env_ids[env_i:env_i + 1],
+                        )
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance ramp")
+
+                hold_samples = [[] for _ in range(active_envs)]
+                full_forces = [
+                    case["direction_w"] * case["force_n"]
+                    for case in batch_cases
+                ]
+                for hold_step in range(EE_COMPLIANCE_HOLD_STEPS):
+                    for env_i, case in enumerate(batch_cases):
+                        command_manager.set_eval_root_force_w(
+                            case["body_name"],
+                            full_forces[env_i],
+                            env_ids=env_ids[env_i:env_i + 1],
+                        )
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance hold")
+                    if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
+                        sample = _get_root_eval_sample(command_manager, action_manager, asset, env_ids=env_ids)
+                        for env_i in range(active_envs):
+                            hold_samples[env_i].append({
+                                key: value[env_i:env_i + 1]
+                                for key, value in sample.items()
+                            })
+
+                for env_i, case in enumerate(batch_cases):
+                    hold = _mean_sample_dict(hold_samples[env_i])
+                    base_slice = {
+                        key: value[env_i:env_i + 1]
+                        for key, value in baseline.items()
+                    }
+                    force_w = full_forces[env_i]
+                    force_xy_w = force_w[:2]
+                    force_dir_xy_w = force_xy_w / force_xy_w.norm().clamp_min(1e-6)
+                    target_delta_v_w = force_xy_w / damping
+
+                    command_delta_from_baseline_w = hold["command_velocity_w"] - base_slice["command_velocity_w"]
+                    actual_delta_from_baseline_w = hold["actual_velocity_w"] - base_slice["actual_velocity_w"]
+                    command_residual_from_reference_w = hold["command_velocity_w"] - hold["reference_velocity_w"]
+                    actual_residual_from_reference_w = hold["actual_velocity_w"] - hold["reference_velocity_w"]
+
+                    command_along = (command_delta_from_baseline_w * force_dir_xy_w).sum(dim=-1)
+                    actual_along = (actual_delta_from_baseline_w * force_dir_xy_w).sum(dim=-1)
+                    command_orth = (
+                        command_delta_from_baseline_w - command_along.unsqueeze(-1) * force_dir_xy_w
+                    ).norm(dim=-1)
+                    actual_orth = (
+                        actual_delta_from_baseline_w - actual_along.unsqueeze(-1) * force_dir_xy_w
+                    ).norm(dim=-1)
+                    command_error = (command_delta_from_baseline_w - target_delta_v_w).norm(dim=-1)
+                    actual_error = (actual_delta_from_baseline_w - target_delta_v_w).norm(dim=-1)
+
+                    height_delta = hold["root_height"] - base_slice["root_height"]
+                    yaw_delta_deg = torch.rad2deg(_wrap_to_pi(hold["root_yaw"] - base_slice["root_yaw"]))
+                    command_along_mean = float(command_along.mean().item())
+                    actual_along_mean = float(actual_along.mean().item())
+
+                    record = {
+                        "body": case["body_name"],
+                        "direction": case["direction_name"],
+                        "direction_w": case["direction_w"].detach().cpu().tolist(),
+                        "force_w_n": force_w.detach().cpu().tolist(),
+                        "force_n": case["force_n"],
+                        "target_delta_velocity_w_mps": target_delta_v_w.detach().cpu().tolist(),
+                        "target_delta_velocity_norm_mps": float(target_delta_v_w.norm().item()),
+                        "cfg_damping_n_per_mps": damping,
+                        "measured_command_damping_signed_n_per_mps": _safe_ratio(case["force_n"], command_along_mean),
+                        "measured_command_damping_abs_n_per_mps": _safe_ratio(case["force_n"], abs(command_along_mean)),
+                        "measured_actual_damping_signed_n_per_mps": _safe_ratio(case["force_n"], actual_along_mean),
+                        "measured_actual_damping_abs_n_per_mps": _safe_ratio(case["force_n"], abs(actual_along_mean)),
+                        "baseline_reference_velocity_w_mps": base_slice["reference_velocity_w"].detach().cpu().tolist(),
+                        "baseline_command_velocity_w_mps": base_slice["command_velocity_w"].detach().cpu().tolist(),
+                        "baseline_actual_velocity_w_mps": base_slice["actual_velocity_w"].detach().cpu().tolist(),
+                        "hold_reference_velocity_w_mps": hold["reference_velocity_w"].detach().cpu().tolist(),
+                        "hold_command_velocity_w_mps": hold["command_velocity_w"].detach().cpu().tolist(),
+                        "hold_actual_velocity_w_mps": hold["actual_velocity_w"].detach().cpu().tolist(),
+                        "command_delta_from_baseline_w_mps": command_delta_from_baseline_w.detach().cpu().tolist(),
+                        "actual_delta_from_baseline_w_mps": actual_delta_from_baseline_w.detach().cpu().tolist(),
+                        "command_residual_from_reference_w_mps": command_residual_from_reference_w.detach().cpu().tolist(),
+                        "actual_residual_from_reference_w_mps": actual_residual_from_reference_w.detach().cpu().tolist(),
+                        "command_delta_error_mps": command_error.detach().cpu().tolist(),
+                        "actual_delta_error_mps": actual_error.detach().cpu().tolist(),
+                        "command_delta_along_force_mps": command_along.detach().cpu().tolist(),
+                        "actual_delta_along_force_mps": actual_along.detach().cpu().tolist(),
+                        "command_delta_orthogonal_mps": command_orth.detach().cpu().tolist(),
+                        "actual_delta_orthogonal_mps": actual_orth.detach().cpu().tolist(),
+                        "baseline_root_height_m": base_slice["root_height"].detach().cpu().tolist(),
+                        "hold_root_height_m": hold["root_height"].detach().cpu().tolist(),
+                        "root_height_delta_m": height_delta.detach().cpu().tolist(),
+                        "root_yaw_delta_deg": yaw_delta_deg.detach().cpu().tolist(),
+                    }
+                    records.append(record)
+
+                    print(
+                        f"{case['body_name']:>22s} {case['direction_name']:>2s} {case['force_n']:>4.0f}N "
+                        f"[env {batch_start + env_i:02d}]: "
+                        f"target={target_delta_v_w.norm().item():.3f} m/s, "
+                        f"cmd_along={command_along_mean:.3f} m/s, "
+                        f"actual_along={actual_along_mean:.3f} m/s, "
+                        f"cmd_err={command_error.mean().item():.3f}, "
+                        f"actual_err={actual_error.mean().item():.3f}",
+                        flush=True,
+                    )
+
+            command_manager.clear_eval_root_force()
+
+        command_errors = torch.tensor([r["command_delta_error_mps"] for r in records])
+        actual_errors = torch.tensor([r["actual_delta_error_mps"] for r in records])
+        command_along = torch.tensor([r["command_delta_along_force_mps"] for r in records])
+        actual_along = torch.tensor([r["actual_delta_along_force_mps"] for r in records])
+        command_orth = torch.tensor([r["command_delta_orthogonal_mps"] for r in records])
+        actual_orth = torch.tensor([r["actual_delta_orthogonal_mps"] for r in records])
+        target_norm = torch.tensor([r["target_delta_velocity_norm_mps"] for r in records])
+        height_delta = torch.tensor([r["root_height_delta_m"] for r in records])
+        yaw_delta = torch.tensor([r["root_yaw_delta_deg"] for r in records])
+        command_damping = [
+            r["measured_command_damping_abs_n_per_mps"]
+            for r in records
+            if r["measured_command_damping_abs_n_per_mps"] is not None
+        ]
+        actual_damping = [
+            r["measured_actual_damping_abs_n_per_mps"]
+            for r in records
+            if r["measured_actual_damping_abs_n_per_mps"] is not None
+        ]
+        command_damping_tensor = (
+            torch.tensor(command_damping, dtype=torch.float32)
+            if command_damping
+            else torch.empty(0, dtype=torch.float32)
+        )
+        actual_damping_tensor = (
+            torch.tensor(actual_damping, dtype=torch.float32)
+            if actual_damping
+            else torch.empty(0, dtype=torch.float32)
+        )
+
+        report = {
+            "checkpoint": args.checkpoint,
+            "run_path": args.run_path,
+            "task": args.task,
+            "num_envs": args.root_compliance_num_envs if args.root_compliance_eval else args.num_envs,
+            "root_reference": "static_zero_velocity",
+            "root_force_bodies": body_names,
+            "force_directions": ROOT_COMPLIANCE_FORCE_DIRECTIONS,
+            "force_magnitudes_n": ROOT_COMPLIANCE_FORCE_MAGNITUDES,
+            "ramp_steps": EE_COMPLIANCE_RAMP_STEPS,
+            "hold_steps": EE_COMPLIANCE_HOLD_STEPS,
+            "recovery_steps": EE_COMPLIANCE_RECOVERY_STEPS,
+            "baseline_steps": EE_COMPLIANCE_BASELINE_STEPS,
+            "mean_window_sec": EE_EVAL_MEAN_WINDOW_SEC,
+            "mean_window_steps": mean_window_steps,
+            "external_force": "manual_root_sweep",
+            "root_compliance_target": root_params,
+            "summary": {
+                "target_delta_velocity_norm_mps": _summary(target_norm),
+                "command_delta_error_mps": _summary(command_errors),
+                "actual_delta_error_mps": _summary(actual_errors),
+                "command_delta_along_force_mps": _summary(command_along),
+                "actual_delta_along_force_mps": _summary(actual_along),
+                "command_delta_orthogonal_mps": _summary(command_orth),
+                "actual_delta_orthogonal_mps": _summary(actual_orth),
+                "measured_command_damping_abs_n_per_mps": (
+                    _summary(command_damping_tensor)
+                    if command_damping_tensor.numel() > 0
+                    else None
+                ),
+                "measured_actual_damping_abs_n_per_mps": (
+                    _summary(actual_damping_tensor)
+                    if actual_damping_tensor.numel() > 0
+                    else None
+                ),
+                "root_height_delta_m": _summary(height_delta),
+                "root_yaw_delta_deg": _summary(yaw_delta),
+            },
+            "records": records,
+        }
+
+        if args.root_output is None:
+            args.root_output = _default_ee_report_path(args, "root_compliance_eval")
+        os.makedirs(os.path.dirname(args.root_output) or ".", exist_ok=True)
+        with open(args.root_output, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+
+        cmd_error = report["summary"]["command_delta_error_mps"]
+        actual_error = report["summary"]["actual_delta_error_mps"]
+        cmd_damping = report["summary"]["measured_command_damping_abs_n_per_mps"]
+        actual_damping_summary = report["summary"]["measured_actual_damping_abs_n_per_mps"]
+        print("\n" + "=" * 60)
+        print("ROOT COMPLIANCE EVAL")
+        print("=" * 60)
+        print(
+            "  Command delta error mean/rmse/max: "
+            f"{cmd_error['mean']:.4f} / {cmd_error['rmse']:.4f} / {cmd_error['max']:.4f} m/s"
+        )
+        print(
+            "  Actual delta error mean/rmse/max: "
+            f"{actual_error['mean']:.4f} / {actual_error['rmse']:.4f} / {actual_error['max']:.4f} m/s"
+        )
+        if cmd_damping is not None:
+            print(
+                "  Measured command damping abs mean/min/max: "
+                f"{cmd_damping['mean']:.1f} / {cmd_damping['min']:.1f} / {cmd_damping['max']:.1f} N/(m/s)"
+            )
+        if actual_damping_summary is not None:
+            print(
+                "  Measured actual damping abs mean/min/max: "
+                f"{actual_damping_summary['mean']:.1f} / {actual_damping_summary['min']:.1f} / {actual_damping_summary['max']:.1f} N/(m/s)"
+            )
+        print(f"  Config damping: {damping:.2f} N/(m/s)")
+        print(f"  Report: {args.root_output}")
+        print("=" * 60 + "\n")
+    finally:
+        if env is not None:
+            env.close()
+        simulation_app.close()
 
 
 def evaluate_ee_compliance(cfg, args):
@@ -1397,13 +1815,19 @@ def main():
                         help="Evaluate EE compliance with deterministic EE force sweeps")
     parser.add_argument("--ee_compliance_num_envs", type=int, default=1,
                         help="Number of environments to use for ee_compliance_eval")
+    parser.add_argument("--root_compliance_eval", "--root-compliance-eval", action="store_true", default=False,
+                        help="Evaluate root/locomotion compliance with deterministic world-frame force sweeps")
+    parser.add_argument("--root_compliance_num_envs", type=int, default=1,
+                        help="Number of environments to use for root_compliance_eval")
     parser.add_argument("--external_force", choices=["on", "off", "default"], default="on",
                         help="External force mode: on uses run cfg, off disables it, default loads the shared eval force cfg")
     parser.add_argument("--ee_output", type=str, default=None, help="Path to write EE tracking JSON report")
+    parser.add_argument("--root_output", type=str, default=None, help="Path to write root compliance JSON report")
     args = parser.parse_args()
 
-    if args.ee_tracking_eval and args.ee_compliance_eval:
-        print("Error: --ee_tracking_eval and --ee_compliance_eval are mutually exclusive.")
+    eval_modes = [args.ee_tracking_eval, args.ee_compliance_eval, args.root_compliance_eval]
+    if sum(bool(mode) for mode in eval_modes) > 1:
+        print("Error: --ee_tracking_eval, --ee_compliance_eval, and --root_compliance_eval are mutually exclusive.")
         sys.exit(1)
 
     # Determine checkpoint source
@@ -1489,10 +1913,12 @@ def main():
     external_force_mode = "default" if args.ee_compliance_eval else args.external_force
     _apply_external_force_mode(cfg, external_force_mode)
 
-    if args.ee_tracking_eval or args.ee_compliance_eval:
+    if args.ee_tracking_eval or args.ee_compliance_eval or args.root_compliance_eval:
         cfg["app"]["headless"] = not args.play
         if args.ee_compliance_eval:
             cfg["task"]["num_envs"] = args.ee_compliance_num_envs
+        elif args.root_compliance_eval:
+            cfg["task"]["num_envs"] = args.root_compliance_num_envs
         else:
             cfg["task"]["num_envs"] = args.num_envs
         cfg["task"]["max_episode_length"] = EE_TRACKING_MAX_EPISODE_LENGTH
@@ -1507,7 +1933,9 @@ def main():
             cfg["task"]["command"]["disable_motion_finish"] = True
             cfg["task"]["command"]["teleop"] = {"enabled": False, "obs_source": "motion"}
 
-        fixed_low_level_force_limit = _fix_low_level_force_limit_for_ee_eval(cfg)
+        fixed_low_level_force_limit = None
+        if args.ee_tracking_eval or args.ee_compliance_eval:
+            fixed_low_level_force_limit = _fix_low_level_force_limit_for_ee_eval(cfg)
 
         if "init_noise" in cfg["task"]["command"]:
             cfg["task"]["command"]["init_noise"] = {
@@ -1531,6 +1959,9 @@ def main():
         if args.ee_compliance_eval:
             cfg["task"]["objects"] = []
             print("  Objects: cleared for empty compliance eval scene")
+        if args.root_compliance_eval:
+            cfg["task"]["objects"] = []
+            print("  Objects: cleared for empty root compliance eval scene")
 
     if args.ee_tracking_eval:
         print("\n" + "="*60)
@@ -1567,6 +1998,23 @@ def main():
         print("="*60 + "\n")
 
         evaluate_ee_compliance(cfg, args)
+
+    elif args.root_compliance_eval:
+        print("\n" + "="*60)
+        print("MANIPULATION TASK (Root Compliance Eval)")
+        print("="*60)
+        print(f"  Run: {args.run_path or args.checkpoint}")
+        print(f"  Num envs: {args.root_compliance_num_envs}")
+        print(f"  Root force bodies: {ROOT_COMPLIANCE_BODY_NAMES}")
+        print(f"  Force directions: {[name for name, _ in ROOT_COMPLIANCE_FORCE_DIRECTIONS]}")
+        print(f"  Force magnitudes: {ROOT_COMPLIANCE_FORCE_MAGNITUDES} N")
+        print(f"  Reference velocity: 0 m/s")
+        print(f"  Hold steps: {EE_COMPLIANCE_HOLD_STEPS}")
+        print(f"  Mean window: {EE_EVAL_MEAN_WINDOW_SEC:.2f} s")
+        print("  External force: manual sweep using task net_pull cfg")
+        print("="*60 + "\n")
+
+        evaluate_root_compliance(cfg, args)
 
     # Play mode settings
     elif args.play:

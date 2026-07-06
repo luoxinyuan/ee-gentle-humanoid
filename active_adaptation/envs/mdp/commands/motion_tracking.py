@@ -1882,6 +1882,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.eval_ee_force_body_local_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.eval_ee_force_b = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
         self.eval_ee_force_w = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
+        self.eval_root_force_enabled = False
+        self.eval_root_force_body_idx_asset = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.eval_root_force_body_local_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.eval_root_force_w = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.device)
 
     def set_external_force_enabled(self, enabled: bool):
         self.external_force_enabled = bool(enabled)
@@ -2098,6 +2102,72 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
         env_ids = torch.arange(self.num_envs, device=self.device)
         point_w = self.asset.data.body_pos_w[env_ids, self.eval_ee_force_body_idx_asset]
+        self.net_pull_point_b[:] = quat_apply_inverse(
+            self.asset.data.root_quat_w,
+            point_w - self.asset.data.root_pos_w,
+        )
+        self.force_sample_timer[:] = 1
+        self.update_net_pull_ee_compliance_target()
+
+    def set_eval_root_force_w(self, body_name: str, force_w: torch.Tensor, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        if force_w.ndim == 1:
+            force_w = force_w.unsqueeze(0).expand(env_ids.numel(), -1)
+        force_w = force_w.to(device=self.device, dtype=torch.float32)
+        if force_w.shape != (env_ids.numel(), 3):
+            raise ValueError(
+                f"force_w must have shape {(env_ids.numel(), 3)} or (3,), got {tuple(force_w.shape)}."
+            )
+        if body_name not in self.asset.body_names:
+            raise RuntimeError(f"Eval root force body {body_name} not found in asset bodies.")
+        body_idx = torch.tensor(self.asset.body_names.index(body_name), dtype=torch.long, device=self.device)
+        matches = (self.net_pull_idx_asset == body_idx).nonzero(as_tuple=False).flatten()
+        if matches.numel() == 0:
+            raise RuntimeError(f"Eval root force body {body_name} is not present in net_pull_apply_pattern.")
+
+        self.eval_root_force_enabled = True
+        self.eval_root_force_body_idx_asset[env_ids] = body_idx
+        self.eval_root_force_body_local_idx[env_ids] = matches[0]
+        self.eval_root_force_w[env_ids] = force_w
+
+    def clear_eval_root_force(self):
+        self.eval_root_force_enabled = False
+        self.eval_root_force_body_idx_asset.zero_()
+        self.eval_root_force_body_local_idx.zero_()
+        self.eval_root_force_w.zero_()
+        if hasattr(self, "net_pull_force_w"):
+            self.net_pull_force_w.zero_()
+            self.net_pull_force_b.zero_()
+            self.net_pull_force_dir_w.zero_()
+            self.net_pull_force_tl.current.zero_()
+            for buffer_name in (
+                "net_pull_ee_force_b",
+                "force_applied_w",
+                "force_applied_b",
+                "force_expected_w",
+                "force_expected_b",
+                "force_apply_buffer",
+                "torque_apply_buffer",
+            ):
+                if hasattr(self, buffer_name):
+                    getattr(self, buffer_name).zero_()
+        if hasattr(self, "update_net_pull_ee_compliance_target"):
+            self.update_net_pull_ee_compliance_target()
+
+    def _update_eval_root_force_target(self):
+        self.net_pull_body_local_idx[:] = self.eval_root_force_body_local_idx
+        self.net_pull_force_w[:] = self.eval_root_force_w
+        self.net_pull_force_b[:] = quat_apply_inverse(self.asset.data.root_quat_w, self.net_pull_force_w)
+        self.net_pull_force_dir_w[:] = normalize(self.net_pull_force_w)
+        self.net_pull_force_tl.current[:] = self.net_pull_force_w.norm(dim=-1, keepdim=True)
+        self.net_pull_phase[:] = 2
+        self.net_pull_phase_timer[:] = 1
+
+        env_ids = torch.arange(self.num_envs, device=self.device)
+        point_w = self.asset.data.body_pos_w[env_ids, self.eval_root_force_body_idx_asset]
         self.net_pull_point_b[:] = quat_apply_inverse(
             self.asset.data.root_quat_w,
             point_w - self.asset.data.root_pos_w,
@@ -2748,6 +2818,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         if getattr(self, "eval_ee_force_enabled", False):
             self._update_eval_ee_force_target()
             return
+        if getattr(self, "eval_root_force_enabled", False):
+            self._update_eval_root_force_target()
+            return
         if self.external_force_mode == "net_pull":
             self.force_safe_limit_tl.update_time()
             self.net_pull_force_tl.update_time()
@@ -2770,6 +2843,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.set_external_force_enabled(False)
             return
         if getattr(self, "eval_ee_force_enabled", False):
+            self.force_apply_net_pull(substep)
+            self._limit_net_wrench_about_torso()
+            return
+        if getattr(self, "eval_root_force_enabled", False):
             self.force_apply_net_pull(substep)
             self._limit_net_wrench_about_torso()
             return
