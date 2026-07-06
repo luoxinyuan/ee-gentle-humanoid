@@ -3179,6 +3179,17 @@ class RootCommandMotionTrackingCommand_impedance(MotionTrackingCommand_impedance
             return self._command_from_udp()[..., :5]
         return self._command_from_motion()[..., :5]
 
+    @observation
+    def root_command_reference(self):
+        return self.get_root_command_reference()
+
+    def root_command_reference_sym(self):
+        return sym_utils.SymmetryTransform.cat([
+            sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1]),
+            sym_utils.SymmetryTransform(perm=torch.arange(2), signs=[1, -1]),
+            sym_utils.SymmetryTransform(perm=torch.arange(2), signs=[1, -1]),
+        ])
+
     def get_root_and_wrist_6d_reference(self):
         if self.use_root_and_wrist_6d_reference_override:
             return self.root_and_wrist_6d_reference_override

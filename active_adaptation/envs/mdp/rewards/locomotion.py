@@ -532,17 +532,19 @@ class root_force_velocity_tracking(Reward):
         env,
         weight: float,
         damping: float = 300.0,
-        max_speed: float = 0.6,
+        max_speed: float | None = 0.6,
         sigma: float = 0.25,
         force_deadband: float = 20.0,
+        add_root_command_reference: bool = False,
         enabled: bool = True,
     ):
         super().__init__(env, weight, enabled)
         self.asset: Articulation = self.env.scene["robot"]
         self.damping = damping
-        self.max_speed = max_speed
+        self.max_speed = None if max_speed is None else float(max_speed)
         self.sigma = sigma
         self.force_deadband = force_deadband
+        self.add_root_command_reference = add_root_command_reference
 
     def _net_force_xy(self) -> torch.Tensor:
         command = self.env.command_manager
@@ -557,7 +559,15 @@ class root_force_velocity_tracking(Reward):
         force_xy = self._net_force_xy()
         force_norm = force_xy.norm(dim=-1, keepdim=True)
         active_force_xy = torch.where(force_norm > self.force_deadband, force_xy, torch.zeros_like(force_xy))
-        desired_vel_xy = clamp_norm(active_force_xy / self.damping, max=self.max_speed)
+        desired_vel_xy = active_force_xy / self.damping
+        if self.max_speed is not None:
+            desired_vel_xy = clamp_norm(desired_vel_xy, max=self.max_speed)
+        if self.add_root_command_reference and hasattr(self.env.command_manager, "get_root_command_reference"):
+            root_ref = self.env.command_manager.get_root_command_reference()
+            ref_vel_b = torch.zeros(self.num_envs, 3, device=self.device)
+            ref_vel_b[:, :2] = root_ref[:, 1:3]
+            ref_vel_w = quat_apply(yaw_quat(self.asset.data.root_quat_w), ref_vel_b)
+            desired_vel_xy = desired_vel_xy + ref_vel_w[:, :2]
         vel_error = (self.asset.data.root_lin_vel_w[:, :2] - desired_vel_xy).norm(dim=-1, keepdim=True)
         return torch.exp(-vel_error / self.sigma)
 

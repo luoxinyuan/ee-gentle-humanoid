@@ -178,7 +178,18 @@ class HierarchicalRootCommand(ActionManager):
         self.root_command_cfg = dict(root_command or {})
         self.root_command_enabled = self.root_command_cfg.get("enabled", True)
         self.root_command_passthrough_reference = self.root_command_cfg.get("passthrough_reference", False)
-        self.root_command_dim = 5 if self.root_command_enabled else 0
+        self.root_command_mode = self.root_command_cfg.get("mode", "absolute")
+        if not self.root_command_enabled:
+            self.root_command_dim = 0
+        elif self.root_command_mode == "absolute":
+            self.root_command_dim = 5
+        elif self.root_command_mode == "velocity_delta":
+            self.root_command_dim = 2
+        else:
+            raise ValueError(
+                "HierarchicalRootCommand root_command.mode must be one of "
+                f"['absolute', 'velocity_delta'], got {self.root_command_mode!r}."
+            )
         self.root_storage_dim = 5
         self.ee_command_cfg = dict(ee_command or {})
         self.ee_command_enabled = self.ee_command_cfg.get("enabled", False)
@@ -237,6 +248,7 @@ class HierarchicalRootCommand(ActionManager):
 
         self.high_action_buf = torch.zeros(self.num_envs, 3, self.action_dim, device=self.device)
         self.root_command = torch.zeros(self.num_envs, self.root_storage_dim, device=self.device)
+        self.root_command_buf = torch.zeros(self.num_envs, 3, self.root_storage_dim, device=self.device)
         self.ee_command = torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
         self.ee_command_buf = torch.zeros(self.num_envs, 3, self.ee_storage_dim, device=self.device)
         self.feet_command = torch.zeros(self.num_envs, self.feet_command_dim, device=self.device)
@@ -269,20 +281,51 @@ class HierarchicalRootCommand(ActionManager):
         return self.low_action_manager.symmetry_transforms()
 
     def _reset_root_command(self, env_ids: torch.Tensor):
+        if (
+            self.root_command_enabled
+            and self.root_command_mode == "velocity_delta"
+            and hasattr(self.env.command_manager, "get_root_command_reference")
+        ):
+            self.root_command[env_ids] = self._get_root_command_reference()[env_ids]
+            return
         self.root_command[env_ids] = 0.0
         self.root_command[env_ids, 0] = self.nominal_root_height
         self.root_command[env_ids, 3] = 1.0
 
     def _set_default_root_command(self):
+        if (
+            self.root_command_enabled
+            and self.root_command_mode == "velocity_delta"
+            and hasattr(self.env.command_manager, "get_root_command_reference")
+        ):
+            self.root_command[:] = self._get_root_command_reference()
+            return
         self.root_command[:] = 0.0
         self.root_command[:, 0] = self.nominal_root_height
         self.root_command[:, 3] = 1.0
 
     def _set_root_command_reference(self):
         if hasattr(self.env.command_manager, "get_root_command_reference"):
-            self.root_command[:] = self.env.command_manager.get_root_command_reference()
+            self.root_command[:] = self._get_root_command_reference()
             return
         self._set_default_root_command()
+
+    def _default_root_command(self) -> torch.Tensor:
+        command = torch.zeros(self.num_envs, self.root_storage_dim, device=self.device)
+        command[:, 0] = self.nominal_root_height
+        command[:, 3] = 1.0
+        return command
+
+    def _get_root_command_reference(self) -> torch.Tensor:
+        if not hasattr(self.env.command_manager, "get_root_command_reference"):
+            return self._default_root_command()
+        try:
+            reference = self.env.command_manager.get_root_command_reference()
+        except Exception:
+            return self._default_root_command()
+        if reference.shape[-1] != self.root_storage_dim:
+            return self._default_root_command()
+        return reference.clone()
 
     def _get_ee_command_reference(self) -> torch.Tensor:
         if not self.ee_command_enabled:
@@ -320,6 +363,9 @@ class HierarchicalRootCommand(ActionManager):
         self._reset_root_command(env_ids)
         self._reset_ee_command(env_ids)
         self._reset_feet_command(env_ids)
+        self.root_command_buf[env_ids] = self.root_command[env_ids].unsqueeze(1).expand(
+            -1, self.root_command_buf.shape[1], -1
+        )
         if self.ee_command_enabled:
             self.ee_command_buf[env_ids] = self.ee_command[env_ids].unsqueeze(1).expand(
                 -1, self.ee_command_buf.shape[1], -1
@@ -340,8 +386,14 @@ class HierarchicalRootCommand(ActionManager):
             command[:, 0] = self.nominal_root_height
             command[:, 3] = 1.0
             return command
+        if self.root_command_mode == "velocity_delta":
+            action = torch.tanh(raw_action) * self.command_scale[:, 1:3]
+            command = self._get_root_command_reference()
+            command[:, 1:3] = command[:, 1:3] + action[:, :2]
+            return command
+
         action = torch.tanh(raw_action) * self.command_scale
-        command = torch.zeros_like(action)
+        command = torch.zeros(self.num_envs, self.root_storage_dim, device=self.device)
         command[:, 0] = self.nominal_root_height + action[:, 0]
         command[:, 1:3] = action[:, 1:3]
 
@@ -382,6 +434,8 @@ class HierarchicalRootCommand(ActionManager):
             cursor = 0
             if self.root_command_enabled:
                 self.root_command[:] = self._decode_root_command(raw_action[:, cursor:cursor + self.root_command_dim])
+                self.root_command_buf = torch.roll(self.root_command_buf, shifts=1, dims=1)
+                self.root_command_buf[:, 0, :] = self.root_command
                 cursor += self.root_command_dim
             elif self.root_command_passthrough_reference:
                 self._set_root_command_reference()
