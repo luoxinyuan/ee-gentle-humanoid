@@ -54,10 +54,6 @@ observation:
       force_deadband: ${task.reward.ee_compliance.ee_force_compliance_tracking.force_deadband}
     prev_high_actions: {steps: 3}
 
-action:
-  ee_command:
-    pos_scale: [0.20, 0.20, 0.20]
-
 reward:
   loco:
     survival: {weight: 0.0, enabled: false}
@@ -82,7 +78,3 @@ reward:
       weight: 0.0
       sigma: [1.0, 0.5]
       enabled: false
-  regularization:
-    high_action_l2: {weight: 0.005}
-    high_action_rate_l2: {weight: 0.10}
-    high_action_rate2_l2: {weight: 0.05}

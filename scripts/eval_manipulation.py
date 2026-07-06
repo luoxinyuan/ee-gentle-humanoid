@@ -424,6 +424,16 @@ def _set_ee_eval_target(command_manager, action_manager, command: torch.Tensor):
         _set_ee_command(command_manager, command)
 
 
+def _get_hl_ee_command_pos_b(action_manager, env_ids: torch.Tensor | None = None):
+    if not _is_hierarchical_action_manager(action_manager):
+        return None
+    ee_command = getattr(action_manager, "ee_command", None)
+    if ee_command is None or ee_command.shape[-1] < 6:
+        return None
+    command_pos_b = ee_command[:, :6].reshape(ee_command.shape[0], 2, 3)
+    return _slice_envs(command_pos_b, env_ids)
+
+
 def _set_external_force(command_manager, enabled: bool):
     if hasattr(command_manager, "set_external_force_enabled"):
         command_manager.set_external_force_enabled(enabled)
@@ -1017,6 +1027,7 @@ def evaluate_ee_compliance(cfg, args):
                 compliance_target_samples = [[] for _ in range(active_envs)]
                 compliance_offset_samples = [[] for _ in range(active_envs)]
                 force_samples = [[] for _ in range(active_envs)]
+                hl_command_samples = [[] for _ in range(active_envs)]
                 full_forces = [
                     case["direction_b"] * case["force_n"]
                     for case in batch_cases
@@ -1030,6 +1041,7 @@ def evaluate_ee_compliance(cfg, args):
                     _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance hold")
                     if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
                         sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
+                        sample_hl_command_pos_b = _get_hl_ee_command_pos_b(action_manager, env_ids=env_ids)
                         for env_i, case in enumerate(batch_cases):
                             sample_compliance_target_b, sample_compliance_offset_b, sample_force_b = _compute_ee_compliance_target_b(
                                 command_manager,
@@ -1045,16 +1057,40 @@ def evaluate_ee_compliance(cfg, args):
                             compliance_target_samples[env_i].append(sample_compliance_target_b)
                             compliance_offset_samples[env_i].append(sample_compliance_offset_b)
                             force_samples[env_i].append(sample_force_b)
+                            if sample_hl_command_pos_b is not None:
+                                hl_command_samples[env_i].append(sample_hl_command_pos_b[env_i:env_i + 1])
 
                 for env_i, case in enumerate(batch_cases):
                     actual_pos_b, actual_quat_b = _mean_pose_samples(pos_samples[env_i], quat_samples[env_i])
                     compliance_target_b = _mean_tensor_samples(compliance_target_samples[env_i])
                     compliance_offset_b = _mean_tensor_samples(compliance_offset_samples[env_i])
                     force_b = _mean_tensor_samples(force_samples[env_i])
+                    hl_command_pos_b = (
+                        _mean_tensor_samples(hl_command_samples[env_i])
+                        if hl_command_samples[env_i]
+                        else None
+                    )
                     nominal_error = (actual_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i]+1]).norm(dim=-1)
                     compliance_error = (actual_pos_b - compliance_target_b).norm(dim=-1)
                     nominal_delta_b = actual_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i]+1]
                     compliance_delta_b = actual_pos_b - compliance_target_b
+                    if hl_command_pos_b is not None:
+                        hl_command_nominal_delta_b = hl_command_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i]+1]
+                        hl_command_compliance_delta_b = hl_command_pos_b - compliance_target_b
+                        actual_to_hl_command_delta_b = actual_pos_b - hl_command_pos_b
+                        actual_to_hl_command_error = actual_to_hl_command_delta_b.norm(dim=-1)
+                        hl_command_to_compliance_error = hl_command_compliance_delta_b.norm(dim=-1)
+                        selected_hl_command_delta_b = hl_command_nominal_delta_b[:, case["ee_i"]]
+                        selected_hl_command_along = (selected_hl_command_delta_b * case["direction_b"]).sum(dim=-1)
+                        hl_command_along_mean = float(selected_hl_command_along.mean().item())
+                    else:
+                        hl_command_nominal_delta_b = None
+                        hl_command_compliance_delta_b = None
+                        actual_to_hl_command_delta_b = None
+                        actual_to_hl_command_error = None
+                        hl_command_to_compliance_error = None
+                        selected_hl_command_along = None
+                        hl_command_along_mean = None
                     selected_delta_b = actual_pos_b[:, case["ee_i"]] - baseline_pos_b[env_ids[env_i], case["ee_i"]]
                     selected_along = (selected_delta_b * case["direction_b"]).sum(dim=-1)
                     selected_orth = (selected_delta_b - selected_along.unsqueeze(-1) * case["direction_b"]).norm(dim=-1)
@@ -1064,6 +1100,11 @@ def evaluate_ee_compliance(cfg, args):
                     if abs(along_mean) > 1e-5:
                         measured_stiffness_signed = float(case["force_n"] / along_mean)
                         measured_stiffness_abs = float(case["force_n"] / abs(along_mean))
+                    hl_command_measured_stiffness_signed = None
+                    hl_command_measured_stiffness_abs = None
+                    if hl_command_along_mean is not None and abs(hl_command_along_mean) > 1e-5:
+                        hl_command_measured_stiffness_signed = float(case["force_n"] / hl_command_along_mean)
+                        hl_command_measured_stiffness_abs = float(case["force_n"] / abs(hl_command_along_mean))
 
                     rpy_error = torch.rad2deg(_wrap_to_pi(_quat_to_rpy_wxyz(actual_quat_b) - target_rpy_b[env_ids[env_i]:env_ids[env_i]+1]).abs())
                     quat_error = _quat_angle_error_deg(actual_quat_b, target_quat_b[env_ids[env_i]:env_ids[env_i]+1])
@@ -1080,19 +1121,57 @@ def evaluate_ee_compliance(cfg, args):
                         ),
                         "measured_stiffness_signed_n_per_m": measured_stiffness_signed,
                         "measured_stiffness_abs_n_per_m": measured_stiffness_abs,
+                        "hl_command_measured_stiffness_signed_n_per_m": hl_command_measured_stiffness_signed,
+                        "hl_command_measured_stiffness_abs_n_per_m": hl_command_measured_stiffness_abs,
                         "deflection_along_m_mean": along_mean,
                         "deflection_along_m": selected_along.detach().cpu().tolist(),
                         "deflection_orth_m": selected_orth.detach().cpu().tolist(),
+                        "hl_command_deflection_along_m_mean": hl_command_along_mean,
+                        "hl_command_deflection_along_m": (
+                            selected_hl_command_along.detach().cpu().tolist()
+                            if selected_hl_command_along is not None
+                            else None
+                        ),
                         "nominal_delta_xyz_m": nominal_delta_b.detach().cpu().tolist(),
                         "compliance_delta_xyz_m": compliance_delta_b.detach().cpu().tolist(),
+                        "hl_command_nominal_delta_xyz_m": (
+                            hl_command_nominal_delta_b.detach().cpu().tolist()
+                            if hl_command_nominal_delta_b is not None
+                            else None
+                        ),
+                        "hl_command_compliance_delta_xyz_m": (
+                            hl_command_compliance_delta_b.detach().cpu().tolist()
+                            if hl_command_compliance_delta_b is not None
+                            else None
+                        ),
+                        "actual_to_hl_command_delta_xyz_m": (
+                            actual_to_hl_command_delta_b.detach().cpu().tolist()
+                            if actual_to_hl_command_delta_b is not None
+                            else None
+                        ),
                         "target_pos_b": sample_center_b[env_ids[env_i]].detach().cpu().tolist(),
                         "baseline_pos_b": baseline_pos_b[env_ids[env_i]].detach().cpu().tolist(),
                         "actual_pos_b": actual_pos_b.detach().cpu().tolist(),
+                        "hl_command_pos_b": (
+                            hl_command_pos_b.detach().cpu().tolist()
+                            if hl_command_pos_b is not None
+                            else None
+                        ),
                         "compliance_target_pos_b": compliance_target_b.detach().cpu().tolist(),
                         "compliance_offset_b": compliance_offset_b.detach().cpu().tolist(),
                         "ee_force_b": force_b.detach().cpu().tolist(),
                         "nominal_pos_error_m": nominal_error.detach().cpu().tolist(),
                         "compliance_pos_error_m": compliance_error.detach().cpu().tolist(),
+                        "actual_to_hl_command_error_m": (
+                            actual_to_hl_command_error.detach().cpu().tolist()
+                            if actual_to_hl_command_error is not None
+                            else None
+                        ),
+                        "hl_command_to_compliance_error_m": (
+                            hl_command_to_compliance_error.detach().cpu().tolist()
+                            if hl_command_to_compliance_error is not None
+                            else None
+                        ),
                         "rpy_abs_error_deg": rpy_error.detach().cpu().tolist(),
                         "quat_angle_error_deg": quat_error.detach().cpu().tolist(),
                     })
@@ -1115,17 +1194,41 @@ def evaluate_ee_compliance(cfg, args):
         deflections = torch.tensor([r["deflection_along_m"] for r in records])
         nominal_delta_xyz = torch.tensor([r["nominal_delta_xyz_m"] for r in records])
         compliance_delta_xyz = torch.tensor([r["compliance_delta_xyz_m"] for r in records])
+        hl_command_records = [r for r in records if r["hl_command_pos_b"] is not None]
+        if hl_command_records:
+            hl_command_nominal_delta_xyz = torch.tensor([r["hl_command_nominal_delta_xyz_m"] for r in hl_command_records])
+            hl_command_compliance_delta_xyz = torch.tensor([r["hl_command_compliance_delta_xyz_m"] for r in hl_command_records])
+            actual_to_hl_command_delta_xyz = torch.tensor([r["actual_to_hl_command_delta_xyz_m"] for r in hl_command_records])
+            actual_to_hl_command_errors = torch.tensor([r["actual_to_hl_command_error_m"] for r in hl_command_records])
+            hl_command_to_compliance_errors = torch.tensor([r["hl_command_to_compliance_error_m"] for r in hl_command_records])
+        else:
+            hl_command_nominal_delta_xyz = None
+            hl_command_compliance_delta_xyz = None
+            actual_to_hl_command_delta_xyz = None
+            actual_to_hl_command_errors = None
+            hl_command_to_compliance_errors = None
         measured_stiffness = [
             r["measured_stiffness_abs_n_per_m"]
             for r in records
             if r["measured_stiffness_abs_n_per_m"] is not None
+        ]
+        hl_command_measured_stiffness = [
+            r["hl_command_measured_stiffness_abs_n_per_m"]
+            for r in records
+            if r["hl_command_measured_stiffness_abs_n_per_m"] is not None
         ]
         measured_stiffness_tensor = (
             torch.tensor(measured_stiffness, dtype=torch.float32)
             if measured_stiffness
             else torch.empty(0, dtype=torch.float32)
         )
+        hl_command_measured_stiffness_tensor = (
+            torch.tensor(hl_command_measured_stiffness, dtype=torch.float32)
+            if hl_command_measured_stiffness
+            else torch.empty(0, dtype=torch.float32)
+        )
         measured_stiffness_xyz = {}
+        hl_command_measured_stiffness_xyz = {}
         for axis in ("x", "y", "z"):
             axis_values = [
                 r["measured_stiffness_abs_n_per_m"]
@@ -1138,6 +1241,17 @@ def evaluate_ee_compliance(cfg, args):
                 else torch.empty(0, dtype=torch.float32)
             )
             measured_stiffness_xyz[axis] = _summary(axis_tensor) if axis_tensor.numel() > 0 else None
+            hl_axis_values = [
+                r["hl_command_measured_stiffness_abs_n_per_m"]
+                for r in records
+                if r["direction"].endswith(axis) and r["hl_command_measured_stiffness_abs_n_per_m"] is not None
+            ]
+            hl_axis_tensor = (
+                torch.tensor(hl_axis_values, dtype=torch.float32)
+                if hl_axis_values
+                else torch.empty(0, dtype=torch.float32)
+            )
+            hl_command_measured_stiffness_xyz[axis] = _summary(hl_axis_tensor) if hl_axis_tensor.numel() > 0 else None
 
         report = {
             "checkpoint": args.checkpoint,
@@ -1174,6 +1288,39 @@ def evaluate_ee_compliance(cfg, args):
                     "right": _summary(compliance_errors[:, :, 1]),
                 },
                 "compliance_position_delta_xyz_m": _component_summary(compliance_delta_xyz),
+                "hl_command_nominal_delta_xyz_m": (
+                    _component_summary(hl_command_nominal_delta_xyz)
+                    if hl_command_nominal_delta_xyz is not None
+                    else None
+                ),
+                "hl_command_compliance_delta_xyz_m": (
+                    _component_summary(hl_command_compliance_delta_xyz)
+                    if hl_command_compliance_delta_xyz is not None
+                    else None
+                ),
+                "actual_to_hl_command_delta_xyz_m": (
+                    _component_summary(actual_to_hl_command_delta_xyz)
+                    if actual_to_hl_command_delta_xyz is not None
+                    else None
+                ),
+                "actual_to_hl_command_error_m": (
+                    {
+                        "combined": _summary(actual_to_hl_command_errors),
+                        "left": _summary(actual_to_hl_command_errors[:, :, 0]),
+                        "right": _summary(actual_to_hl_command_errors[:, :, 1]),
+                    }
+                    if actual_to_hl_command_errors is not None
+                    else None
+                ),
+                "hl_command_to_compliance_error_m": (
+                    {
+                        "combined": _summary(hl_command_to_compliance_errors),
+                        "left": _summary(hl_command_to_compliance_errors[:, :, 0]),
+                        "right": _summary(hl_command_to_compliance_errors[:, :, 1]),
+                    }
+                    if hl_command_to_compliance_errors is not None
+                    else None
+                ),
                 "deflection_along_m": _summary(deflections),
                 "measured_stiffness_abs_n_per_m": (
                     _summary(measured_stiffness_tensor)
@@ -1181,6 +1328,12 @@ def evaluate_ee_compliance(cfg, args):
                     else None
                 ),
                 "measured_stiffness_abs_xyz_n_per_m": measured_stiffness_xyz,
+                "hl_command_measured_stiffness_abs_n_per_m": (
+                    _summary(hl_command_measured_stiffness_tensor)
+                    if hl_command_measured_stiffness_tensor.numel() > 0
+                    else None
+                ),
+                "hl_command_measured_stiffness_abs_xyz_n_per_m": hl_command_measured_stiffness_xyz,
             },
             "records": records,
         }
