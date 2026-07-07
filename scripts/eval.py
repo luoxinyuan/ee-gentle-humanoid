@@ -154,6 +154,8 @@ def main():
     if args.baseline_root_command:
         cfg["task"]["action"]["override_root_command"] = True
 
+    cfg["task"]["randomization"] = {}
+
     patch_legacy_force_apply_pattern(cfg)
     patch_missing_reward_sigma(cfg)
     

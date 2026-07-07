@@ -4,7 +4,7 @@ command:
     - ".*hand_mimic"
   net_pull_force_range: [5.0, 30.0]
   net_pull_zero_prob: 0.1
-  net_pull_curriculum: true
+  net_pull_curriculum: false
   net_pull_curriculum_end: 0.6
   net_pull_zero_prob_start: 0.85
   net_pull_force_scale_start: 0.25

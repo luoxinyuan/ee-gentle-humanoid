@@ -1,3 +1,5 @@
+from collections.abc import Sequence as SequenceABC
+
 import torch
 import einops
 from typing import Dict, Literal, Tuple, Union, TYPE_CHECKING
@@ -65,12 +67,18 @@ class JointPosition(ActionManager):
         self.action_scaling = torch.tensor(self.action_scaling, device=self.device)
         self.action_dim = len(self.joint_ids)
 
-        if isinstance(max_delay, (list, tuple)):
+        if isinstance(max_delay, SequenceABC) and not isinstance(max_delay, (str, bytes)):
+            if len(max_delay) != 2:
+                raise ValueError(f"max_delay range must have exactly 2 values, got {max_delay}.")
             self.min_delay = int(max_delay[0])
             self.max_delay = int(max_delay[1])
         else:
             self.min_delay = 0
             self.max_delay = int(max_delay or 0)  # physics steps
+        if self.min_delay < 0 or self.max_delay < self.min_delay:
+            raise ValueError(
+                f"Invalid max_delay range: min_delay={self.min_delay}, max_delay={self.max_delay}."
+            )
 
         self.alpha_range = alpha
         self.alpha_wide_range = alpha_wide

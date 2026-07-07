@@ -1956,6 +1956,7 @@ def main():
             cfg["task"]["num_envs"] = args.num_envs
         cfg["task"]["max_episode_length"] = EE_TRACKING_MAX_EPISODE_LENGTH
         cfg["task"]["termination"] = {}
+        cfg["task"]["randomization"] = {}
         cfg["export_policy"] = False
         cfg["perf_test"] = False
 

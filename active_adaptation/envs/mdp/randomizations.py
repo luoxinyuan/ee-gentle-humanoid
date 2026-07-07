@@ -157,17 +157,18 @@ class perturb_body_materials(Randomization):
         logging.info(f"Randomize body materials of {self.body_names} upon startup.")
 
         materials = self.default_materials.clone()
+        shape_ids = self.shape_ids.to(device=materials.device)
         if self.homogeneous:
             shape = (self.num_envs, 1)
         else:
             shape = (self.num_envs, len(self.shape_ids))
 
-        sf  = sample_uniform(shape, *self.static_friction_range)                      # static friction
+        sf  = sample_uniform(shape, *self.static_friction_range, device=materials.device)  # static friction
         if self.dynamic_friction_range is None:
-            dff = sample_uniform(shape, *self.dynamic_friction_frac_range)            # dynamic-fraction
+            dff = sample_uniform(shape, *self.dynamic_friction_frac_range, device=materials.device)  # dynamic-fraction
         else:
-            df = sample_uniform(shape, *self.dynamic_friction_range)                  # dynamic friction
-        res = sample_uniform(shape, *self.restitution_range)                          # restitution
+            df = sample_uniform(shape, *self.dynamic_friction_range, device=materials.device)  # dynamic friction
+        res = sample_uniform(shape, *self.restitution_range, device=materials.device)  # restitution
 
         def _bucketize(x, lo, hi, n):
             step = (hi - lo) / (n - 1)
@@ -184,9 +185,9 @@ class perturb_body_materials(Randomization):
         res = _bucketize(res, *self.restitution_range,               N)
         # -------------------------------------------------------------
 
-        materials[:, self.shape_ids, 0] = sf
-        materials[:, self.shape_ids, 1] = df
-        materials[:, self.shape_ids, 2] = res
+        materials[:, shape_ids, 0] = sf
+        materials[:, shape_ids, 1] = df
+        materials[:, shape_ids, 2] = res
 
         indices = torch.arange(self.asset.num_instances)
 
@@ -221,9 +222,10 @@ class perturb_body_mass(Randomization):
         masses = self.asset.data.default_mass.clone()
         inertias = self.asset.data.default_inertia.clone()
         print(f"Default masses: {masses[0]}")
+        mass_ranges = self.mass_ranges.to(device=masses.device)
         scale = uniform(
-            self.mass_ranges[:, 0].expand_as(masses[:, self.body_ids]),
-            self.mass_ranges[:, 1].expand_as(masses[:, self.body_ids])
+            mass_ranges[:, 0].expand_as(masses[:, self.body_ids]),
+            mass_ranges[:, 1].expand_as(masses[:, self.body_ids])
         )
         masses[:, self.body_ids] *= scale
         inertias[:, self.body_ids] *= scale.unsqueeze(-1)
@@ -250,9 +252,11 @@ class perturb_body_com(Randomization):
     
     def startup(self):
         coms = self.asset.root_physx_view.get_coms()
+        com_low = self.com_low.to(device=coms.device)
+        com_high = self.com_high.to(device=coms.device)
         rand_offset = uniform(
-            self.com_low.expand(self.asset.num_instances, len(self.body_ids), 3),
-            self.com_high.expand(self.asset.num_instances, len(self.body_ids), 3),
+            com_low.expand(self.asset.num_instances, len(self.body_ids), 3),
+            com_high.expand(self.asset.num_instances, len(self.body_ids), 3),
         )
         coms[:, self.body_ids, :3] += rand_offset
         self.asset.root_physx_view.set_coms(coms, indices=self.ALL_INDICES)
