@@ -125,6 +125,7 @@ class perturb_body_materials(Randomization):
         body_names,
         static_friction_range=(0.6, 1.0),
         dynamic_friction_frac_range=(0.6, 1.0),
+        dynamic_friction_range=None,
         restitution_range=(0.0, 0.2),
         homogeneous: bool = False,
         num_buckets: int = 16,
@@ -135,6 +136,7 @@ class perturb_body_materials(Randomization):
 
         self.static_friction_range = static_friction_range
         self.dynamic_friction_frac_range = dynamic_friction_frac_range
+        self.dynamic_friction_range = dynamic_friction_range
         self.restitution_range = restitution_range
         self.homogeneous = homogeneous
         self.num_buckets = num_buckets
@@ -161,7 +163,10 @@ class perturb_body_materials(Randomization):
             shape = (self.num_envs, len(self.shape_ids))
 
         sf  = sample_uniform(shape, *self.static_friction_range)                      # static friction
-        dff = sample_uniform(shape, *self.dynamic_friction_frac_range)                # dynamic-fraction
+        if self.dynamic_friction_range is None:
+            dff = sample_uniform(shape, *self.dynamic_friction_frac_range)            # dynamic-fraction
+        else:
+            df = sample_uniform(shape, *self.dynamic_friction_range)                  # dynamic friction
         res = sample_uniform(shape, *self.restitution_range)                          # restitution
 
         def _bucketize(x, lo, hi, n):
@@ -171,12 +176,16 @@ class perturb_body_materials(Randomization):
 
         N = self.num_buckets                       # 16 ⇒ 4096 种组合上限
         sf  = _bucketize(sf,  *self.static_friction_range,           N)
-        dff = _bucketize(dff, *self.dynamic_friction_frac_range,     N)
+        if self.dynamic_friction_range is None:
+            dff = _bucketize(dff, *self.dynamic_friction_frac_range, N)
+            df = dff * sf
+        else:
+            df = _bucketize(df, *self.dynamic_friction_range,        N)
         res = _bucketize(res, *self.restitution_range,               N)
         # -------------------------------------------------------------
 
         materials[:, self.shape_ids, 0] = sf
-        materials[:, self.shape_ids, 1] = dff * sf
+        materials[:, self.shape_ids, 1] = df
         materials[:, self.shape_ids, 2] = res
 
         indices = torch.arange(self.asset.num_instances)
@@ -188,15 +197,23 @@ class perturb_body_materials(Randomization):
 
 class perturb_body_mass(Randomization):
     def __init__(
-        self, env, **perturb_ranges: Tuple[float, float]
+        self,
+        env,
+        body_names=None,
+        scale_range=None,
+        **perturb_ranges: Tuple[float, float],
     ):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
+        if body_names is not None:
+            if scale_range is None:
+                raise ValueError("perturb_body_mass scale_range is required when body_names is set.")
+            perturb_ranges = {body_names: scale_range}
 
         self.body_ids, self.body_names, values = string_utils.resolve_matching_names_values(
             perturb_ranges, self.asset.body_names
         )
-        self.mass_ranges = torch.tensor(values)
+        self.mass_ranges = torch.tensor(values, device=self.device)
         print(self.body_names)
 
     def startup(self):
@@ -216,18 +233,68 @@ class perturb_body_mass(Randomization):
         assert torch.allclose(self.asset.root_physx_view.get_masses(), masses)
 
 class perturb_body_com(Randomization):
-    def __init__(self, env, body_names = ".*", com_range=(-0.05, 0.05)):
+    def __init__(self, env, body_names = ".*", com_range=(-0.05, 0.05), x=None, y=None, z=None):
         super().__init__(env)
         self.asset: Articulation = self.env.scene["robot"]
-        self.com_range = com_range
+        if x is not None or y is not None or z is not None:
+            x = x if x is not None else com_range
+            y = y if y is not None else com_range
+            z = z if z is not None else com_range
+            self.com_low = torch.tensor([x[0], y[0], z[0]], device=self.device)
+            self.com_high = torch.tensor([x[1], y[1], z[1]], device=self.device)
+        else:
+            self.com_low = torch.full((3,), float(com_range[0]), device=self.device)
+            self.com_high = torch.full((3,), float(com_range[1]), device=self.device)
         self.body_ids, self.body_names = self.asset.find_bodies(body_names)
         self.ALL_INDICES = torch.arange(self.asset.num_instances)
     
     def startup(self):
         coms = self.asset.root_physx_view.get_coms()
-        rand_offset = sample_uniform((self.asset.num_instances, len(self.body_ids), 3), *self.com_range)
+        rand_offset = uniform(
+            self.com_low.expand(self.asset.num_instances, len(self.body_ids), 3),
+            self.com_high.expand(self.asset.num_instances, len(self.body_ids), 3),
+        )
         coms[:, self.body_ids, :3] += rand_offset
         self.asset.root_physx_view.set_coms(coms, indices=self.ALL_INDICES)
+
+class push_robot(Randomization):
+    def __init__(
+        self,
+        env,
+        enabled: bool = True,
+        interval_range_s=(3.0, 6.0),
+        lin_vel_xy_range=(-0.3, 0.3),
+        yaw_vel_range=(-0.5, 0.5),
+    ):
+        super().__init__(env)
+        self.asset: Articulation = self.env.scene["robot"]
+        self.enabled = enabled
+        self.interval_range_s = interval_range_s
+        self.lin_vel_xy_range = lin_vel_xy_range
+        self.yaw_vel_range = yaw_vel_range
+        self.next_push_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+    def _sample_interval_steps(self, n: int):
+        interval = sample_uniform((n,), *self.interval_range_s, device=self.device)
+        return torch.clamp((interval / self.env.step_dt).long(), min=1)
+
+    def reset(self, env_ids: torch.Tensor):
+        if not self.enabled:
+            return
+        self.next_push_step[env_ids] = self.env.episode_length_buf[env_ids] + self._sample_interval_steps(len(env_ids))
+
+    def step(self, substep):
+        if not self.enabled or substep != 0:
+            return
+        env_ids = torch.nonzero(self.env.episode_length_buf >= self.next_push_step, as_tuple=False).squeeze(-1)
+        if env_ids.numel() == 0:
+            return
+
+        root_vel = self.asset.data.root_vel_w[env_ids].clone()
+        root_vel[:, 0:2] = sample_uniform((env_ids.numel(), 2), *self.lin_vel_xy_range, device=self.device)
+        root_vel[:, 5] = sample_uniform((env_ids.numel(),), *self.yaw_vel_range, device=self.device)
+        self.asset.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
+        self.next_push_step[env_ids] = self.env.episode_length_buf[env_ids] + self._sample_interval_steps(env_ids.numel())
 
 class random_joint_offset(Randomization):
     def __init__(self, env, **offset_range: Tuple[float, float]):

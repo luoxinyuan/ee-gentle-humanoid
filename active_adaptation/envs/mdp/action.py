@@ -65,7 +65,12 @@ class JointPosition(ActionManager):
         self.action_scaling = torch.tensor(self.action_scaling, device=self.device)
         self.action_dim = len(self.joint_ids)
 
-        self.max_delay = max_delay or 0  # physics steps
+        if isinstance(max_delay, (list, tuple)):
+            self.min_delay = int(max_delay[0])
+            self.max_delay = int(max_delay[1])
+        else:
+            self.min_delay = 0
+            self.max_delay = int(max_delay or 0)  # physics steps
 
         self.alpha_range = alpha
         self.alpha_wide_range = alpha_wide
@@ -106,11 +111,11 @@ class JointPosition(ActionManager):
 
         # Delay selection ---------------------------------------------------
         if self.boot_protect_enabled:
-            delay = torch.randint(0, self.max_delay + 1, (len(env_ids), 1), device=self.device)
+            delay = torch.randint(self.min_delay, self.max_delay + 1, (len(env_ids), 1), device=self.device)
             self.boot_delay[env_ids] = delay
             self.delay[env_ids] = delay
         else:
-            self.delay[env_ids] = torch.randint(0, self.max_delay + 1, (len(env_ids), 1), device=self.device)
+            self.delay[env_ids] = torch.randint(self.min_delay, self.max_delay + 1, (len(env_ids), 1), device=self.device)
 
         # α per environment --------------------------------------------------
         alpha = torch.empty(len(env_ids), 1, device=self.device).uniform_(*self.alpha_range)

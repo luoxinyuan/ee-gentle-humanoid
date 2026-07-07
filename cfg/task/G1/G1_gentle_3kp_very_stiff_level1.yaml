@@ -1,0 +1,42 @@
+name: G1GENTLE3KPVERYSTIFFLEVEL1
+
+defaults:
+  - /task/G1/G1_gentle_3kp_stiff@_here_
+  - _self_
+
+terrain: plane_loco
+
+action:
+  max_delay: [2, 4]
+  alpha: [0.8, 1.0]
+  alpha_wide: [0.8, 1.0]
+  alpha_jit_scale: null
+
+randomization:
+  perturb_body_materials:
+    body_names: ".*ankle_roll_link|.*foot.*"
+    static_friction_range: [0.5, 1.6]
+    dynamic_friction_range: [0.4, 1.2]
+    restitution_range: [0.0, 0.1]
+  perturb_body_mass:
+    body_names: ".*"
+    scale_range: [0.9, 1.1]
+  perturb_body_com:
+    body_names: ["pelvis", "torso_link"]
+    x: [-0.02, 0.02]
+    y: [-0.03, 0.03]
+    z: [-0.03, 0.03]
+  motor_params_implicit:
+    stiffness_range:
+      .*: [0.9, 1.1]
+    damping_range:
+      .*: [0.9, 1.1]
+    armature_range:
+      .*: [0.75, 1.25]
+  random_joint_offset:
+    .*: [-0.01, 0.01]
+  push_robot:
+    enabled: true
+    interval_range_s: [3.0, 6.0]
+    lin_vel_xy_range: [-0.3, 0.3]
+    yaw_vel_range: [-0.5, 0.5]
