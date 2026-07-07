@@ -89,6 +89,12 @@ EE_COMPLIANCE_RAMP_STEPS = 25
 EE_COMPLIANCE_HOLD_STEPS = 100
 EE_COMPLIANCE_RECOVERY_STEPS = 50
 EE_COMPLIANCE_BASELINE_STEPS = 50
+ROOT_COMPLIANCE_RAMP_STEPS = 50
+ROOT_COMPLIANCE_HOLD_STEPS = 250
+ROOT_COMPLIANCE_RECOVERY_STEPS = 100
+ROOT_COMPLIANCE_BASELINE_STEPS = 100
+ROOT_COMPLIANCE_WARMUP_STEPS = 100
+ROOT_COMPLIANCE_MEAN_WINDOW_SEC = 1.0
 ROOT_COMPLIANCE_BODY_NAMES = [
     "torso_link",
     "left_shoulder_yaw_link",
@@ -195,9 +201,9 @@ def _mean_pose_samples(pos_samples: list[torch.Tensor], quat_samples: list[torch
     return pos, quat
 
 
-def _mean_window_steps(base_env) -> int:
+def _mean_window_steps(base_env, window_sec: float = EE_EVAL_MEAN_WINDOW_SEC) -> int:
     step_dt = float(getattr(base_env, "step_dt", 0.02))
-    return max(1, int(round(EE_EVAL_MEAN_WINDOW_SEC / step_dt)))
+    return max(1, int(round(window_sec / step_dt)))
 
 
 def _get_ee_compliance_params(cfg) -> dict:
@@ -959,15 +965,38 @@ def evaluate_root_compliance(cfg, args):
                 f"Requested candidates: {ROOT_COMPLIANCE_BODY_NAMES}"
             )
 
+        ee_body_names = [name.strip() for name in EE_TRACKING_BODY_NAMES.split(",")]
+        try:
+            ee_body_ids = [asset.body_names.index(name) for name in ee_body_names]
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Cannot find EE body name from {ee_body_names}. Available bodies: {asset.body_names}"
+            ) from exc
+        default_ee_pos_b, _ = _body_pose_in_root_frame(asset, ee_body_ids)
+        default_ee_center_b = _get_ee_sample_center(default_ee_pos_b, base_env.device)
+        default_ee_axis_angle_b = torch.zeros(base_env.num_envs, 2, 3, device=base_env.device)
+        default_ee_command = torch.cat(
+            [
+                default_ee_center_b.reshape(base_env.num_envs, 6),
+                default_ee_axis_angle_b.reshape(base_env.num_envs, 6),
+            ],
+            dim=-1,
+        )
+
         root_params = _get_root_compliance_params(cfg)
         damping = float(root_params["damping"])
-        mean_window_steps = min(_mean_window_steps(base_env), EE_COMPLIANCE_HOLD_STEPS)
-        baseline_window_steps = min(mean_window_steps, EE_COMPLIANCE_BASELINE_STEPS)
+        mean_window_steps = min(
+            _mean_window_steps(base_env, ROOT_COMPLIANCE_MEAN_WINDOW_SEC),
+            ROOT_COMPLIANCE_HOLD_STEPS,
+        )
+        baseline_window_steps = min(mean_window_steps, ROOT_COMPLIANCE_BASELINE_STEPS)
 
         td_ = env.reset()
         _disable_eval_timer_reset(base_env)
         _set_static_root_command(command_manager, asset)
+        _set_ee_eval_target(command_manager, action_manager, default_ee_command)
         print("Static root command enabled for root compliance eval: reference velocity = 0.", flush=True)
+        print("Default EE target enabled for root compliance eval.", flush=True)
         print(
             "Root compliance target: "
             f"delta_v_w = force_xy_w / damping, damping={damping:.2f} N/(m/s), "
@@ -1008,26 +1037,27 @@ def evaluate_root_compliance(cfg, args):
                 td_ = env.reset()
                 _disable_eval_timer_reset(base_env)
                 _set_static_root_command(command_manager, asset)
+                _set_ee_eval_target(command_manager, action_manager, default_ee_command)
 
-                for _ in range(EE_TRACKING_WARMUP_STEPS):
+                for _ in range(ROOT_COMPLIANCE_WARMUP_STEPS):
                     _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance warmup")
 
                 baseline_samples = []
-                for step in range(EE_COMPLIANCE_BASELINE_STEPS):
+                for step in range(ROOT_COMPLIANCE_BASELINE_STEPS):
                     command_manager.clear_eval_root_force()
                     _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance baseline")
-                    if step >= EE_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
+                    if step >= ROOT_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
                         baseline_samples.append(
                             _get_root_eval_sample(command_manager, action_manager, asset, env_ids=env_ids)
                         )
                 baseline = _mean_sample_dict(baseline_samples)
 
-                for _ in range(EE_COMPLIANCE_RECOVERY_STEPS):
+                for _ in range(ROOT_COMPLIANCE_RECOVERY_STEPS):
                     command_manager.clear_eval_root_force()
                     _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance recovery")
 
-                for ramp_step in range(EE_COMPLIANCE_RAMP_STEPS):
-                    ramp_ratio = float(ramp_step + 1) / float(EE_COMPLIANCE_RAMP_STEPS)
+                for ramp_step in range(ROOT_COMPLIANCE_RAMP_STEPS):
+                    ramp_ratio = float(ramp_step + 1) / float(ROOT_COMPLIANCE_RAMP_STEPS)
                     for env_i, case in enumerate(batch_cases):
                         force_w = case["direction_w"] * (case["force_n"] * ramp_ratio)
                         command_manager.set_eval_root_force_w(
@@ -1042,7 +1072,7 @@ def evaluate_root_compliance(cfg, args):
                     case["direction_w"] * case["force_n"]
                     for case in batch_cases
                 ]
-                for hold_step in range(EE_COMPLIANCE_HOLD_STEPS):
+                for hold_step in range(ROOT_COMPLIANCE_HOLD_STEPS):
                     for env_i, case in enumerate(batch_cases):
                         command_manager.set_eval_root_force_w(
                             case["body_name"],
@@ -1050,7 +1080,7 @@ def evaluate_root_compliance(cfg, args):
                             env_ids=env_ids[env_i:env_i + 1],
                         )
                     _, td_ = _rollout_one_step(env, rollout_policy, td_, "root compliance hold")
-                    if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
+                    if hold_step >= ROOT_COMPLIANCE_HOLD_STEPS - mean_window_steps:
                         sample = _get_root_eval_sample(command_manager, action_manager, asset, env_ids=env_ids)
                         for env_i in range(active_envs):
                             hold_samples[env_i].append({
@@ -1175,14 +1205,17 @@ def evaluate_root_compliance(cfg, args):
             "task": args.task,
             "num_envs": args.root_compliance_num_envs if args.root_compliance_eval else args.num_envs,
             "root_reference": "static_zero_velocity",
+            "default_ee_center_b": default_ee_center_b.detach().cpu().tolist(),
+            "configured_ee_center_b": EE_TRACKING_DEFAULT_EE_CENTER_B,
             "root_force_bodies": body_names,
             "force_directions": ROOT_COMPLIANCE_FORCE_DIRECTIONS,
             "force_magnitudes_n": ROOT_COMPLIANCE_FORCE_MAGNITUDES,
-            "ramp_steps": EE_COMPLIANCE_RAMP_STEPS,
-            "hold_steps": EE_COMPLIANCE_HOLD_STEPS,
-            "recovery_steps": EE_COMPLIANCE_RECOVERY_STEPS,
-            "baseline_steps": EE_COMPLIANCE_BASELINE_STEPS,
-            "mean_window_sec": EE_EVAL_MEAN_WINDOW_SEC,
+            "warmup_steps": ROOT_COMPLIANCE_WARMUP_STEPS,
+            "ramp_steps": ROOT_COMPLIANCE_RAMP_STEPS,
+            "hold_steps": ROOT_COMPLIANCE_HOLD_STEPS,
+            "recovery_steps": ROOT_COMPLIANCE_RECOVERY_STEPS,
+            "baseline_steps": ROOT_COMPLIANCE_BASELINE_STEPS,
+            "mean_window_sec": ROOT_COMPLIANCE_MEAN_WINDOW_SEC,
             "mean_window_steps": mean_window_steps,
             "external_force": "manual_root_sweep",
             "root_compliance_target": root_params,
@@ -2009,8 +2042,11 @@ def main():
         print(f"  Force directions: {[name for name, _ in ROOT_COMPLIANCE_FORCE_DIRECTIONS]}")
         print(f"  Force magnitudes: {ROOT_COMPLIANCE_FORCE_MAGNITUDES} N")
         print(f"  Reference velocity: 0 m/s")
-        print(f"  Hold steps: {EE_COMPLIANCE_HOLD_STEPS}")
-        print(f"  Mean window: {EE_EVAL_MEAN_WINDOW_SEC:.2f} s")
+        print(f"  Warmup steps: {ROOT_COMPLIANCE_WARMUP_STEPS}")
+        print(f"  Ramp steps: {ROOT_COMPLIANCE_RAMP_STEPS}")
+        print(f"  Hold steps: {ROOT_COMPLIANCE_HOLD_STEPS}")
+        print(f"  Baseline/recovery steps: {ROOT_COMPLIANCE_BASELINE_STEPS}/{ROOT_COMPLIANCE_RECOVERY_STEPS}")
+        print(f"  Mean window: {ROOT_COMPLIANCE_MEAN_WINDOW_SEC:.2f} s")
         print("  External force: manual sweep using task net_pull cfg")
         print("="*60 + "\n")
 
