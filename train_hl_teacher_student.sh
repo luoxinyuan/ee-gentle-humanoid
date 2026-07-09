@@ -7,7 +7,7 @@ HL_WANDB_PROJECT="gentle_humanoid_high_level"
 CUDA_VISIBLE_DEVICES="3,4,5,6"
 MASTER_PORT="29504"
 NPROC="4"
-LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30"
+LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_verystiff_adapt_level1_sim2real"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
@@ -58,5 +58,5 @@ run_pipeline() {
     "run:${HL_PROJECT_PATH}/${teacher_run_id}"
 }
 
-run_pipeline "G1/G1_hl_ee_x_compliance_pos_delta_student" "ee_200x_3kp_nomargin_nocurr_stu"
-run_pipeline "G1/G1_hl_ee_z_compliance_pos_delta_student" "ee_200z_3kp_nomargin_nocurr_stu"
+run_pipeline "G1/G1_hl_ee_x_compliance_pos_delta_student" "ee_200x_3kp_verystiff_adapt_nomargin_nocurr_stu"
+# run_pipeline "G1/G1_hl_ee_z_compliance_pos_delta_student" "ee_200z_3kp_nomargin_nocurr_stu"

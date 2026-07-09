@@ -268,6 +268,16 @@ def _component_summary(values: torch.Tensor) -> dict:
     }
 
 
+def _direct_force_pred_b_from_tensordict(td, command_manager):
+    if "direct_priv_pred" not in td.keys():
+        return None
+    pred = td["direct_priv_pred"]
+    if pred.shape[-1] < 6:
+        return None
+    force_limit = float(getattr(command_manager, "net_pull_force_range", (1.0, 1.0))[1])
+    return pred[..., 3:6] * max(force_limit, 1e-6)
+
+
 def _get_ee_compliance_eval_info(command_manager, params: dict, use_command_manager_target: bool = True) -> dict:
     if (
         use_command_manager_target
@@ -849,10 +859,13 @@ def evaluate_ee_tracking(cfg, args):
         simulation_app.close()
 
 
-def _rollout_one_step(env, rollout_policy, td_, step_label: str):
+def _rollout_one_step(env, rollout_policy, td_, step_label: str, return_policy_td: bool = False):
     td_ = rollout_policy(td_)
+    policy_td = td_ if return_policy_td else None
     td, td_ = env.step_and_maybe_reset(td_)
     _warn_if_done(td, step_label)
+    if return_policy_td:
+        return td, td_, policy_td
     return td, td_
 
 
@@ -1478,6 +1491,7 @@ def evaluate_ee_compliance(cfg, args):
                 compliance_target_samples = [[] for _ in range(active_envs)]
                 compliance_offset_samples = [[] for _ in range(active_envs)]
                 force_samples = [[] for _ in range(active_envs)]
+                force_pred_samples = [[] for _ in range(active_envs)]
                 hl_command_samples = [[] for _ in range(active_envs)]
                 full_forces = [
                     case["direction_b"] * case["force_n"]
@@ -1489,8 +1503,15 @@ def evaluate_ee_compliance(cfg, args):
                         if mask.any():
                             force_b = torch.stack([full_forces[i] for i, m in enumerate(mask.tolist()) if m], dim=0)
                             command_manager.set_eval_ee_force_b(ee_i, force_b, env_ids=env_ids[mask])
-                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance hold")
+                    _, td_, policy_td = _rollout_one_step(
+                        env,
+                        rollout_policy,
+                        td_,
+                        "compliance hold",
+                        return_policy_td=True,
+                    )
                     if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
+                        direct_force_pred_b = _direct_force_pred_b_from_tensordict(policy_td, command_manager)
                         sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
                         sample_hl_command_pos_b = _get_hl_ee_command_pos_b(action_manager, env_ids=env_ids)
                         for env_i, case in enumerate(batch_cases):
@@ -1508,6 +1529,10 @@ def evaluate_ee_compliance(cfg, args):
                             compliance_target_samples[env_i].append(sample_compliance_target_b)
                             compliance_offset_samples[env_i].append(sample_compliance_offset_b)
                             force_samples[env_i].append(sample_force_b)
+                            if direct_force_pred_b is not None:
+                                force_pred_samples[env_i].append(
+                                    direct_force_pred_b[env_ids[env_i]:env_ids[env_i] + 1]
+                                )
                             if sample_hl_command_pos_b is not None:
                                 hl_command_samples[env_i].append(sample_hl_command_pos_b[env_i:env_i + 1])
 
@@ -1516,6 +1541,15 @@ def evaluate_ee_compliance(cfg, args):
                     compliance_target_b = _mean_tensor_samples(compliance_target_samples[env_i])
                     compliance_offset_b = _mean_tensor_samples(compliance_offset_samples[env_i])
                     force_b = _mean_tensor_samples(force_samples[env_i])
+                    force_pred_b = (
+                        _mean_tensor_samples(force_pred_samples[env_i])
+                        if force_pred_samples[env_i]
+                        else None
+                    )
+                    force_pred_error_b = force_pred_b - force_b[:, case["ee_i"]] if force_pred_b is not None else None
+                    force_pred_error_norm = force_pred_error_b.norm(dim=-1) if force_pred_error_b is not None else None
+                    force_pred_actual_norm = force_b[:, case["ee_i"]].norm(dim=-1)
+                    force_pred_norm = force_pred_b.norm(dim=-1) if force_pred_b is not None else None
                     hl_command_pos_b = (
                         _mean_tensor_samples(hl_command_samples[env_i])
                         if hl_command_samples[env_i]
@@ -1611,6 +1645,27 @@ def evaluate_ee_compliance(cfg, args):
                         "compliance_target_pos_b": compliance_target_b.detach().cpu().tolist(),
                         "compliance_offset_b": compliance_offset_b.detach().cpu().tolist(),
                         "ee_force_b": force_b.detach().cpu().tolist(),
+                        "force_estimator_pred_b": (
+                            force_pred_b.detach().cpu().tolist()
+                            if force_pred_b is not None
+                            else None
+                        ),
+                        "force_estimator_error_b": (
+                            force_pred_error_b.detach().cpu().tolist()
+                            if force_pred_error_b is not None
+                            else None
+                        ),
+                        "force_estimator_error_norm_n": (
+                            force_pred_error_norm.detach().cpu().tolist()
+                            if force_pred_error_norm is not None
+                            else None
+                        ),
+                        "force_estimator_pred_norm_n": (
+                            force_pred_norm.detach().cpu().tolist()
+                            if force_pred_norm is not None
+                            else None
+                        ),
+                        "force_estimator_actual_norm_n": force_pred_actual_norm.detach().cpu().tolist(),
                         "nominal_pos_error_m": nominal_error.detach().cpu().tolist(),
                         "compliance_pos_error_m": compliance_error.detach().cpu().tolist(),
                         "actual_to_hl_command_error_m": (
@@ -1646,6 +1701,7 @@ def evaluate_ee_compliance(cfg, args):
         nominal_delta_xyz = torch.tensor([r["nominal_delta_xyz_m"] for r in records])
         compliance_delta_xyz = torch.tensor([r["compliance_delta_xyz_m"] for r in records])
         hl_command_records = [r for r in records if r["hl_command_pos_b"] is not None]
+        force_estimator_records = [r for r in records if r["force_estimator_pred_b"] is not None]
         if hl_command_records:
             hl_command_nominal_delta_xyz = torch.tensor([r["hl_command_nominal_delta_xyz_m"] for r in hl_command_records])
             hl_command_compliance_delta_xyz = torch.tensor([r["hl_command_compliance_delta_xyz_m"] for r in hl_command_records])
@@ -1658,6 +1714,18 @@ def evaluate_ee_compliance(cfg, args):
             actual_to_hl_command_delta_xyz = None
             actual_to_hl_command_errors = None
             hl_command_to_compliance_errors = None
+        if force_estimator_records:
+            force_estimator_pred_b = torch.tensor([r["force_estimator_pred_b"] for r in force_estimator_records])
+            force_estimator_error_b = torch.tensor([r["force_estimator_error_b"] for r in force_estimator_records])
+            force_estimator_error_norm = torch.tensor([r["force_estimator_error_norm_n"] for r in force_estimator_records])
+            force_estimator_pred_norm = torch.tensor([r["force_estimator_pred_norm_n"] for r in force_estimator_records])
+            force_estimator_actual_norm = torch.tensor([r["force_estimator_actual_norm_n"] for r in force_estimator_records])
+        else:
+            force_estimator_pred_b = None
+            force_estimator_error_b = None
+            force_estimator_error_norm = None
+            force_estimator_pred_norm = None
+            force_estimator_actual_norm = None
         measured_stiffness = [
             r["measured_stiffness_abs_n_per_m"]
             for r in records
@@ -1785,6 +1853,17 @@ def evaluate_ee_compliance(cfg, args):
                     else None
                 ),
                 "hl_command_measured_stiffness_abs_xyz_n_per_m": hl_command_measured_stiffness_xyz,
+                "force_estimator": (
+                    {
+                        "pred_force_b_n": _component_summary(force_estimator_pred_b),
+                        "error_force_b_n": _component_summary(force_estimator_error_b),
+                        "error_norm_n": _summary(force_estimator_error_norm),
+                        "pred_norm_n": _summary(force_estimator_pred_norm),
+                        "actual_norm_n": _summary(force_estimator_actual_norm),
+                    }
+                    if force_estimator_records
+                    else None
+                ),
             },
             "records": records,
         }
@@ -1799,6 +1878,7 @@ def evaluate_ee_compliance(cfg, args):
         compliance = report["summary"]["compliance_position_error_m"]["combined"]
         stiffness_summary = report["summary"]["measured_stiffness_abs_n_per_m"]
         stiffness_xyz = report["summary"]["measured_stiffness_abs_xyz_n_per_m"]
+        force_estimator_summary = report["summary"].get("force_estimator")
         print("\n" + "=" * 60)
         print("EE COMPLIANCE EVAL")
         print("=" * 60)
@@ -1817,6 +1897,25 @@ def evaluate_ee_compliance(cfg, args):
                 f"x={stiffness_xyz['x']['mean']:.1f}/{stiffness_xyz['x']['min']:.1f}/{stiffness_xyz['x']['max']:.1f}, "
                 f"y={stiffness_xyz['y']['mean']:.1f}/{stiffness_xyz['y']['min']:.1f}/{stiffness_xyz['y']['max']:.1f}, "
                 f"z={stiffness_xyz['z']['mean']:.1f}/{stiffness_xyz['z']['min']:.1f}/{stiffness_xyz['z']['max']:.1f} N/m"
+            )
+        if force_estimator_summary is not None:
+            pred_norm = force_estimator_summary["pred_norm_n"]
+            actual_norm = force_estimator_summary["actual_norm_n"]
+            err_norm = force_estimator_summary["error_norm_n"]
+            err_xyz = force_estimator_summary["error_force_b_n"]
+            print(
+                "  Force estimator pred/actual norm mean: "
+                f"{pred_norm['mean']:.1f} / {actual_norm['mean']:.1f} N"
+            )
+            print(
+                "  Force estimator error norm mean/rmse/max: "
+                f"{err_norm['mean']:.1f} / {err_norm['rmse']:.1f} / {err_norm['max']:.1f} N"
+            )
+            print(
+                "  Force estimator error xyz mean: "
+                f"x={err_xyz['x']['mean']:.1f}, "
+                f"y={err_xyz['y']['mean']:.1f}, "
+                f"z={err_xyz['z']['mean']:.1f} N"
             )
         print(f"  Config stiffness: {compliance_eval_info['actual_stiffness']}")
         print(f"  Report: {args.ee_output}")

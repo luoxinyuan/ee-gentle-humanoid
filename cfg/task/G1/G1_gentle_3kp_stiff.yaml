@@ -10,6 +10,13 @@ command:
   compliance: False
   max_force: 30.0
   net_force_limit: 30.0
+  dataset:
+    mem_paths:
+      - limmt_no_foot_gentle_amass_full
+      - lafan_limmt_filtered
+    path_weights:
+      - 8.0
+      - 1.0
 
 reward:
   impedance:
