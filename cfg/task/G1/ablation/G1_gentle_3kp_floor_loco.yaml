@@ -1,0 +1,9 @@
+name: G1GENTLE3KP_FLOORLOCO
+
+defaults:
+  - /task/G1/G1_gentle_3kp@_here_
+  - _self_
+
+# A1: keep the current 3kp compliance low-level task unchanged, but use a
+# non-bouncy locomotion floor so foot-ground contacts are less elastic.
+terrain: plane_loco

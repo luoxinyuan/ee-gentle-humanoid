@@ -1,0 +1,14 @@
+name: G1GENTLE3KP_FLOORLOCO_FRICTIONNARROW
+
+defaults:
+  - /task/G1/ablation/G1_gentle_3kp_floor_loco@_here_
+  - _self_
+
+# A2: start from A1 and narrow foot material randomization around realistic
+# high-traction indoor contacts.
+randomization:
+  perturb_body_materials:
+    body_names: ".*ankle_roll_link"
+    static_friction_range: [0.7, 1.2]
+    dynamic_friction_frac_range: [0.85, 1.0]
+    restitution_range: [0.0, 0.03]
