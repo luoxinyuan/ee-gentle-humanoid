@@ -74,6 +74,12 @@ reward:
       sigma: 0.10
       max_offset: 0.25
       force_deadband: 0.0
+    ee_force_limit_penalty:
+      weight: 2.0
+      stiffness: ${task.reward.ee_compliance.ee_force_compliance_tracking.stiffness}
+      force_limit: [15.0, 15.0, 15.0]
+      force_deadband: ${task.reward.ee_compliance.ee_force_compliance_tracking.force_deadband}
+      power: 1.0
     ee_orientation_tracking:
       weight: 0.0
       sigma: [1.0, 0.5]

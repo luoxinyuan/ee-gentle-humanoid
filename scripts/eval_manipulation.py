@@ -2168,6 +2168,8 @@ def main():
         _enable_root_passthrough_for_ee_only_hl(cfg)
         cfg["export_policy"] = args.export
         cfg["perf_test"] = False
+        cfg["print_ee_contact_forces"] = True
+        cfg["ee_contact_print_interval"] = 10
         
         # Disable all init noise for consistent starting pose in teleop mode
         cfg["task"]["command"]["init_noise"] = {
@@ -2197,6 +2199,7 @@ def main():
         print(f"  Num envs: {args.num_envs}")
         print(f"  Max episode length: 1000000 steps (~5.5 hours at 50Hz)")
         print(f"  External force: {args.external_force}")
+        print("  EE contact / HL force estimate / HL EE offset print: every 10 steps")
         if args.obs_source == "udp":
             print(f"  Obs source: UDP teleop (waiting for input on port 15000)")
         else:

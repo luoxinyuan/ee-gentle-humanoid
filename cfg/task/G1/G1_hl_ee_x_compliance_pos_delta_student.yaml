@@ -11,3 +11,5 @@ reward:
       # y/z are much stiffer and have small allowed offsets.
       stiffness: [200.0, 600.0, 600.0]
       max_offset: [0.25, 0.05, 0.05]
+    ee_force_limit_penalty:
+      force_limit: [15.0, 30.0, 30.0]

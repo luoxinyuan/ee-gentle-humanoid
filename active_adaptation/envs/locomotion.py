@@ -63,6 +63,10 @@ class SimpleEnv(_Env):
                 track_air_time=True,
                 # filter_prim_paths_expr=["/World/ground"]
             )
+            scene_cfg.ee_contact_forces = ContactSensorCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/.*hand_mimic",
+                history_length=3,
+            )
 
 
             ### add task related objects

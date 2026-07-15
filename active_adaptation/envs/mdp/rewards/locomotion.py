@@ -470,6 +470,109 @@ class ee_force_compliance_tracking(Reward):
         return torch.exp(-error / self.sigma)
 
 
+class ee_force_limit_penalty(Reward):
+    def __init__(
+        self,
+        env,
+        weight: float,
+        stiffness: float | Sequence[float] = 200.0,
+        force_limit: float | Sequence[float] = 30.0,
+        force_deadband: float = 0.0,
+        power: float = 1.0,
+        enabled: bool = True,
+    ):
+        super().__init__(env, weight, enabled)
+        self.asset: Articulation = self.env.scene["robot"]
+        self.stiffness, _ = _parse_xyz_or_scalar(
+            stiffness,
+            name="ee_force_limit_penalty.stiffness",
+            device=self.device,
+        )
+        self.force_limit, _ = _parse_xyz_or_scalar(
+            force_limit,
+            name="ee_force_limit_penalty.force_limit",
+            device=self.device,
+        )
+        self.force_deadband = float(force_deadband)
+        self.power = float(power)
+        if self.power <= 0.0:
+            raise ValueError(f"ee_force_limit_penalty.power must be positive, got {power}.")
+        self.ee_names = ["left_hand_mimic", "right_hand_mimic"]
+        self.contact_sensor = None
+        try:
+            self.contact_sensor = self.env.scene["ee_contact_forces"]
+            self.contact_body_ids, _ = self.contact_sensor.find_bodies(".*hand_mimic")
+        except Exception:
+            self.contact_body_ids = []
+
+    def _ee_asset_ids(self):
+        try:
+            return torch.tensor(
+                [self.asset.body_names.index(name) for name in self.ee_names],
+                device=self.device,
+                dtype=torch.long,
+            )
+        except ValueError:
+            return None
+
+    def _force_b(self, asset_idx: torch.Tensor) -> torch.Tensor:
+        command = self.env.command_manager
+        if (
+            getattr(command, "external_force_mode", "legacy") == "net_pull"
+            and getattr(command, "external_force_enabled", False)
+            and hasattr(command, "get_net_pull_ee_force_b")
+        ):
+            return command.get_net_pull_ee_force_b()
+
+        force_w = torch.zeros(self.num_envs, 2, 3, device=self.device)
+        if self.contact_sensor is not None and len(self.contact_body_ids) >= 2:
+            if hasattr(self.contact_sensor.data, "net_forces_w_history"):
+                data = self.contact_sensor.data.net_forces_w_history.mean(1)
+            else:
+                data = self.contact_sensor.data.net_forces_w
+            force_w[:] = data[:, self.contact_body_ids[:2], :]
+
+        root_quat = self.asset.data.root_quat_w.unsqueeze(1).expand(-1, 2, -1)
+        return quat_apply_inverse(root_quat, force_w)
+
+    def compute(self) -> torch.Tensor:
+        action_manager = getattr(self.env, "action_manager", None)
+        command = self.env.command_manager
+        if action_manager is None or not getattr(action_manager, "ee_command_enabled", False):
+            return torch.zeros(self.num_envs, 1, device=self.device)
+        if not hasattr(command, "get_root_and_wrist_6d_reference"):
+            return torch.zeros(self.num_envs, 1, device=self.device)
+
+        ee_command = getattr(action_manager, "ee_command", None)
+        if ee_command is None or ee_command.shape[-1] < 6:
+            return torch.zeros(self.num_envs, 1, device=self.device)
+
+        asset_idx = self._ee_asset_ids()
+        if asset_idx is None:
+            return torch.zeros(self.num_envs, 1, device=self.device)
+
+        reference = command.get_root_and_wrist_6d_reference()
+        if reference.shape[-1] < 6:
+            return torch.zeros(self.num_envs, 1, device=self.device)
+
+        target_offset_b = (ee_command[:, :6] - reference[:, :6]).reshape(self.num_envs, 2, 3)
+        force_b = self._force_b(asset_idx)
+        force_abs = force_b.abs()
+        force_sign = torch.sign(force_b)
+        relief = (self.stiffness * target_offset_b * force_sign).clamp_min(0.0)
+        remaining_force = (force_abs - relief).clamp_min(0.0)
+        remaining_force = torch.where(
+            force_abs > self.force_deadband,
+            remaining_force,
+            torch.zeros_like(remaining_force),
+        )
+        excess = (remaining_force - self.force_limit).clamp_min(0.0)
+        normalized = excess / self.force_limit
+        if self.power != 1.0:
+            normalized = normalized.pow(self.power)
+        return -normalized.mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+
+
 class ee_orientation_tracking(Reward):
     def __init__(
         self,
