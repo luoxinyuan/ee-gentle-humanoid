@@ -99,6 +99,51 @@ class root_height_below(Termination):
     def __call__(self):
         return self.asset.data.root_pos_w[:, 2:3] < self.min_height
 
+
+class reference_body_height_error(Termination):
+    """Terminate when a body's height deviates too far from the motion reference.
+
+    This is the reference-relative height check used by BeyondMimic.  Unlike
+    ``root_height_below``, it does not impose one absolute standing height, so
+    clips with crouching or other legitimate height changes remain valid.
+    """
+
+    def __init__(
+        self,
+        env,
+        body_name: str = "torso_link",
+        threshold: float = 0.25,
+    ):
+        super().__init__(env)
+        self.asset: Articulation = self.env.scene["robot"]
+        self.command_manager = self.env.command_manager
+        body_ids, body_names = self.asset.find_bodies(body_name)
+        if len(body_ids) != 1:
+            raise ValueError(
+                f"reference_body_height_error expected exactly one body for "
+                f"{body_name!r}, found {body_names}."
+            )
+        self.asset_body_id = body_ids[0]
+        self.body_name = body_names[0]
+        try:
+            self.motion_body_id = self.command_manager.dataset.body_names.index(
+                self.body_name
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Reference motion has no body named {self.body_name!r}."
+            ) from exc
+        self.threshold = float(threshold)
+
+    def __call__(self):
+        current_height = self.asset.data.body_pos_w[:, self.asset_body_id, 2:3]
+        reference_height = (
+            self.command_manager._motion.body_pos_w[:, 0, self.motion_body_id, 2:3]
+            + self.env.scene.env_origins[:, 2:3]
+        )
+        return (current_height - reference_height).abs() > self.threshold
+
+
 class cum_error(Termination):
     def __init__(self, env, thres: float = 0.85, min_steps: int = 50):
         super().__init__(env)

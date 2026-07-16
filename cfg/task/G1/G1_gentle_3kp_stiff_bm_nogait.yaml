@@ -1,0 +1,23 @@
+name: G1GENTLE3KPSTIFFBMNOGAIT
+
+defaults:
+  - /task/G1/G1_gentle_3kp_stiff@_here_
+  - _self_
+
+# BeyondMimic-style ablation: retain this task's EE/root tracking objective,
+# but remove explicit gait/contact shaping so the policy must infer its own
+# support strategy from proprioception and the task reference.
+reward:
+  loco:
+    survival:          {enabled: false}
+    impact_force_l2:   {enabled: false}
+    feet_slip:         {enabled: false}
+    feet_air_time_ref: {enabled: false}
+
+# Keep the inherited cumulative tracking-error termination and add the
+# BeyondMimic reference-relative torso-height failure condition.  This permits
+# legitimate reference height changes while ending clear falls.
+termination:
+  reference_body_height_error:
+    body_name: torso_link
+    threshold: 0.25
