@@ -1,0 +1,68 @@
+name: G1GENTLE3KPSTIFFBMENVHARD
+
+defaults:
+  - /task/G1/G1_gentle_3kp_stiff_bm_nogait@_here_
+  - _self_
+
+# Keep the EE/root objective and no-gait-prior ablation unchanged.  These
+# overrides only make the training physics distribution broader and closer to
+# the BeyondMimic robustness setup.
+terrain: plane_loco
+
+action:
+  # Retain the deployment-relevant zero-delay case while varying the actuator
+  # response more broadly than the baseline.
+  max_delay: [0, 4]
+  alpha: [0.8, 1.0]
+  alpha_wide: [0.8, 1.0]
+  alpha_jit_scale: null
+
+observation:
+  policy:
+    # BeyondMimic actor-noise scales for the analogous proprioceptive signals.
+    root_ang_vel_history:      {history_steps: [0], noise_std: 0.2}
+    projected_gravity_history: {history_steps: [0], noise_std: 0.05}
+    joint_pos_history:         {history_steps: [0, 1, 2, 3, 4], noise_std: 0.01}
+
+randomization:
+  # BeyondMimic randomizes material properties on all bodies.  This matters
+  # when recovery includes contacts beyond the nominal support feet.
+  perturb_body_materials:
+    body_names: ".*"
+    static_friction_range: [0.3, 1.6]
+    dynamic_friction_range: [0.3, 1.2]
+    restitution_range: [0.0, 0.5]
+
+  # Retain the level-1 mass perturbation; it broadens inertia mismatch beyond
+  # the original BeyondMimic configuration.
+  perturb_body_mass:
+    body_names: ".*"
+    scale_range: [0.9, 1.1]
+
+  # BeyondMimic perturbs the torso CoM with wider lateral/vertical ranges.
+  perturb_body_com:
+    body_names: "torso_link"
+    x: [-0.025, 0.025]
+    y: [-0.05, 0.05]
+    z: [-0.05, 0.05]
+
+  motor_params_implicit:
+    stiffness_range:
+      .*: [0.9, 1.1]
+    damping_range:
+      .*: [0.9, 1.1]
+    armature_range:
+      .*: [0.75, 1.25]
+
+  random_joint_offset:
+    .*: [-0.01, 0.01]
+
+  # Match BeyondMimic's more frequent, 6-DoF velocity-push distribution.
+  push_robot:
+    enabled: true
+    interval_range_s: [1.0, 3.0]
+    lin_vel_xy_range: [-0.5, 0.5]
+    lin_vel_z_range: [-0.2, 0.2]
+    roll_vel_range: [-0.52, 0.52]
+    pitch_vel_range: [-0.52, 0.52]
+    yaw_vel_range: [-0.78, 0.78]

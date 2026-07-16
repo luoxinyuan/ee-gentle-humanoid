@@ -268,6 +268,9 @@ class push_robot(Randomization):
         enabled: bool = True,
         interval_range_s=(3.0, 6.0),
         lin_vel_xy_range=(-0.3, 0.3),
+        lin_vel_z_range=None,
+        roll_vel_range=None,
+        pitch_vel_range=None,
         yaw_vel_range=(-0.5, 0.5),
     ):
         super().__init__(env)
@@ -275,6 +278,9 @@ class push_robot(Randomization):
         self.enabled = enabled
         self.interval_range_s = interval_range_s
         self.lin_vel_xy_range = lin_vel_xy_range
+        self.lin_vel_z_range = lin_vel_z_range
+        self.roll_vel_range = roll_vel_range
+        self.pitch_vel_range = pitch_vel_range
         self.yaw_vel_range = yaw_vel_range
         self.next_push_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -296,6 +302,18 @@ class push_robot(Randomization):
 
         root_vel = self.asset.data.root_vel_w[env_ids].clone()
         root_vel[:, 0:2] = sample_uniform((env_ids.numel(), 2), *self.lin_vel_xy_range, device=self.device)
+        if self.lin_vel_z_range is not None:
+            root_vel[:, 2] = sample_uniform(
+                (env_ids.numel(),), *self.lin_vel_z_range, device=self.device
+            )
+        if self.roll_vel_range is not None:
+            root_vel[:, 3] = sample_uniform(
+                (env_ids.numel(),), *self.roll_vel_range, device=self.device
+            )
+        if self.pitch_vel_range is not None:
+            root_vel[:, 4] = sample_uniform(
+                (env_ids.numel(),), *self.pitch_vel_range, device=self.device
+            )
         root_vel[:, 5] = sample_uniform((env_ids.numel(),), *self.yaw_vel_range, device=self.device)
         self.asset.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
         self.next_push_step[env_ids] = self.env.episode_length_buf[env_ids] + self._sample_interval_steps(env_ids.numel())
