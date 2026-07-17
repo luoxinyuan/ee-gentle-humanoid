@@ -44,7 +44,7 @@ run_pipeline() {
 # run_pipeline "G1/G1_gentle_3kp" "gentle_3kp" "limmt_full_stiff30"
 # run_pipeline "G1/G1_gentle_5kp" "gentle_5kp" "limmt_full_stiff30"
 # run_pipeline "G1/G1_gentle_3kp_stiff" "gentle_3kp_stiff" "limmt_lafan_4to1_force30"
-run_pipeline "G1/G1_gentle_3kp_stiff_bm_env_hard" "gentle_3kp_stiff_bm_env_hard" "bm_env_hard"
+run_pipeline "G1/G1_gentle_3kp_stiff_env_hard" "gentle_3kp_stiff_env_hard" "env_hard_gait"
 # run_pipeline "G1/ablation/G1_gentle_3kp_floor_loco" "gentle_3kp_floor_loco" "compliance_force30"
 # run_pipeline "G1/ablation/G1_gentle_3kp_floor_loco_friction_narrow" "gentle_3kp_floor_loco_friction_narrow" "compliance_force30"
 # run_pipeline "G1/G1_gentle_3kp_stiff_rot" "3kp_stiff_rot" "limmt_full_force30_ee_rot05"

@@ -1,0 +1,60 @@
+name: G1GENTLE3KPSTIFFENVHARD
+
+defaults:
+  # Inherit the normal stiff 3kp task so all locomotion/gait rewards remain
+  # enabled (survival, impact, slip, feet_air_time_ref, etc.).
+  - /task/G1/G1_gentle_3kp_stiff@_here_
+  - _self_
+
+# Same harder physics/action-observation distribution as bm_env_hard, without
+# the bm_nogait reward or termination overrides.
+terrain: plane_loco
+
+action:
+  max_delay: [0, 4]
+  alpha: [0.8, 1.0]
+  alpha_wide: [0.8, 1.0]
+  alpha_jit_scale: null
+
+observation:
+  policy:
+    root_ang_vel_history:      {history_steps: [0], noise_std: 0.2}
+    projected_gravity_history: {history_steps: [0], noise_std: 0.05}
+    joint_pos_history:         {history_steps: [0, 1, 2, 3, 4], noise_std: 0.01}
+
+randomization:
+  perturb_body_materials:
+    body_names: ".*"
+    static_friction_range: [0.3, 1.6]
+    dynamic_friction_range: [0.3, 1.2]
+    restitution_range: [0.0, 0.5]
+
+  perturb_body_mass:
+    body_names: ".*"
+    scale_range: [0.9, 1.1]
+
+  perturb_body_com:
+    body_names: "torso_link"
+    x: [-0.025, 0.025]
+    y: [-0.05, 0.05]
+    z: [-0.05, 0.05]
+
+  motor_params_implicit:
+    stiffness_range:
+      .*: [0.9, 1.1]
+    damping_range:
+      .*: [0.9, 1.1]
+    armature_range:
+      .*: [0.75, 1.25]
+
+  random_joint_offset:
+    .*: [-0.01, 0.01]
+
+  push_robot:
+    enabled: true
+    interval_range_s: [1.0, 3.0]
+    lin_vel_xy_range: [-0.5, 0.5]
+    lin_vel_z_range: [-0.2, 0.2]
+    roll_vel_range: [-0.52, 0.52]
+    pitch_vel_range: [-0.52, 0.52]
+    yaw_vel_range: [-0.78, 0.78]
