@@ -266,6 +266,8 @@ class HierarchicalRootCommand(ActionManager):
         self.ee_command_buf = torch.zeros(self.num_envs, 3, self.ee_storage_dim, device=self.device)
         self.feet_command = torch.zeros(self.num_envs, self.feet_command_dim, device=self.device)
         self.low_action = torch.zeros(self.num_envs, self.low_action_manager.action_dim, device=self.device)
+        self.ee_force_stiffness_ablation_enabled = False
+        self.ee_force_stiffness_ablation_command = torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
         self._reset_root_command(torch.arange(self.num_envs, device=self.device))
         self._reset_ee_command(torch.arange(self.num_envs, device=self.device))
         self._reset_feet_command(torch.arange(self.num_envs, device=self.device))
@@ -432,6 +434,19 @@ class HierarchicalRootCommand(ActionManager):
             command[:, :6] = reference[:, :6] + pos_delta.reshape(self.num_envs, 6)
         return command
 
+    def set_ee_force_stiffness_ablation_command(self, command: torch.Tensor):
+        if not self.ee_command_enabled:
+            raise RuntimeError("EE force/stiffness ablation requires ee_command.enabled=True.")
+        command = torch.as_tensor(command, device=self.device, dtype=torch.float32)
+        if command.shape != self.ee_command.shape:
+            raise ValueError(f"Expected ablation EE command shape {tuple(self.ee_command.shape)}, got {tuple(command.shape)}.")
+        self.ee_force_stiffness_ablation_enabled = True
+        self.ee_force_stiffness_ablation_command[:] = command
+
+    def clear_ee_force_stiffness_ablation_command(self):
+        self.ee_force_stiffness_ablation_enabled = False
+        self.ee_force_stiffness_ablation_command.zero_()
+
     def _decode_feet_command(self, raw_action: torch.Tensor) -> torch.Tensor:
         reference = self._get_feet_command_reference()
         action = torch.tanh(raw_action)
@@ -456,6 +471,8 @@ class HierarchicalRootCommand(ActionManager):
                 self._set_default_root_command()
             if self.ee_command_enabled:
                 self.ee_command[:] = self._decode_ee_command(raw_action[:, cursor:cursor + self.ee_command_dim])
+                if self.ee_force_stiffness_ablation_enabled:
+                    self.ee_command[:] = self.ee_force_stiffness_ablation_command
                 self.ee_command_buf = torch.roll(self.ee_command_buf, shifts=1, dims=1)
                 self.ee_command_buf[:, 0, :] = self.ee_command
                 cursor += self.ee_command_dim

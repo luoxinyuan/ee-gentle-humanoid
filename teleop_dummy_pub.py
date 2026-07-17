@@ -14,6 +14,8 @@ import json
 
 np.random.seed(48)
 MAGIC = b"G6D1"
+JOINT_MAGIC = b"G6J1"
+JOINT_TARGET_FUTURE_STEPS = (0, 2, 4, 8, 16)
 # magic(4s) + seq(u32) + N float32. The first 28 floats are fixed:
 # root/head/left_hand/right_hand, each pos3 + quat4. Extra keypoints append
 # after that prefix; the first extension is feet_pos_b with 6 floats.
@@ -87,8 +89,45 @@ DEFAULT_BODY_NAMES_28 = [
 ]
 
 
+DEFAULT_G1_JOINT_NAMES_29 = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+
 def make_packet(seq, floats):
     return struct.pack(PACK_HEADER_FMT + "f" * len(floats), MAGIC, seq, *map(float, floats))
+
+
+def make_packet_with_magic(seq, floats, magic=MAGIC):
+    return struct.pack(PACK_HEADER_FMT + "f" * len(floats), magic, seq, *map(float, floats))
 
 
 class SignalSendLogger:
@@ -289,6 +328,24 @@ def resolve_motion_body_indices(body_names, override):
     }
 
 
+def joint_names_from_motion(m, joint_count):
+    if "joint_names" in m:
+        return [str(x) for x in m["joint_names"].tolist()]
+    if joint_count == len(DEFAULT_G1_JOINT_NAMES_29):
+        return DEFAULT_G1_JOINT_NAMES_29
+    raise ValueError(
+        f"Motion file has {joint_count} joints and no joint_names. "
+        "Pass a motion file with joint_names for mode 5."
+    )
+
+
+def resolve_motion_joint_indices(joint_names):
+    missing = [name for name in DEFAULT_G1_JOINT_NAMES_29 if name not in joint_names]
+    if missing:
+        raise ValueError(f"Motion joint_names missing required G1 joints: {missing}")
+    return [joint_names.index(name) for name in DEFAULT_G1_JOINT_NAMES_29]
+
+
 def yaw_quat_wxyz(q):
     q = quat_normalize_wxyz(q)
     w, x, y, z = q
@@ -379,6 +436,39 @@ def load_motion_packets(path, body_index_override=None, root_mode="velocity"):
         packets.append(root + head + left + right + feet)
 
     return packets, fps, indices, body_names
+
+
+def load_motion_packets_with_joint_targets(path, body_index_override=None, root_mode="velocity"):
+    m = dict(np.load(path, allow_pickle=True))
+    packets, fps, indices, body_names = load_motion_packets(
+        path,
+        body_index_override=body_index_override,
+        root_mode=root_mode,
+    )
+
+    joint_key = "joint_pos" if "joint_pos" in m else "dof_pos" if "dof_pos" in m else None
+    if joint_key is None:
+        raise ValueError("Mode 5 requires motion file key 'joint_pos' or 'dof_pos'.")
+    joint_pos = np.asarray(m[joint_key], dtype=np.float32)
+    if joint_pos.ndim != 2:
+        raise ValueError(f"joint_pos must have shape [T, J], got {joint_pos.shape}.")
+    if joint_pos.shape[0] != len(packets):
+        raise ValueError(
+            f"joint_pos frame count {joint_pos.shape[0]} does not match body frames {len(packets)}."
+        )
+
+    joint_names = joint_names_from_motion(m, joint_pos.shape[1])
+    joint_indices = resolve_motion_joint_indices(joint_names)
+    joint_pos = joint_pos[:, joint_indices]
+
+    packets_with_joint = []
+    num_frames = joint_pos.shape[0]
+    for frame, packet in enumerate(packets):
+        future_frames = [int((frame + step) % num_frames) for step in JOINT_TARGET_FUTURE_STEPS]
+        joint_target = joint_pos[future_frames].reshape(-1)
+        packets_with_joint.append(tuple(packet) + tuple(joint_target.tolist()))
+
+    return packets_with_joint, fps, indices, body_names, DEFAULT_G1_JOINT_NAMES_29
 
 class ILRecorder:
     """
@@ -582,21 +672,21 @@ def main():
     ap.add_argument("--dst_ip", type=str, default="127.0.0.1")
     ap.add_argument("--dst_port", type=int, default=15000)
     ap.add_argument("--hz", type=float, default=None)
-    ap.add_argument("--mode", type=int, default=1, choices=[0, 1, 2, 3, 4],
-                    help="0: send fixed poses; 1: receive VR poses; 2: random pose every 5s; 3: root-state follower; 4: replay motion npz")
+    ap.add_argument("--mode", type=int, default=1, choices=[0, 1, 2, 3, 4, 5],
+                    help="0: fixed poses; 1: VR poses; 2: random pose; 3: root follower; 4: replay 5kp; 5: replay 5kp + joint target")
     ap.add_argument("--broadcast-port", type=int, default=15001,
                     help="UDP port to listen for root state broadcasts (mode 3)")
     ap.add_argument("--motion-file", type=str, default="/home/dexlab/20260224_001_robot.npz",
-                    help="Motion npz to replay in mode 4")
+                    help="Motion npz to replay in mode 4 or mode 5")
     ap.add_argument("--motion-body-indices", type=str, default=None,
-                    help="Optional mode-4 body indices: head,left_hand,right_hand,left_foot,right_foot")
+                    help="Optional mode-4/5 body indices: head,left_hand,right_hand,left_foot,right_foot")
     ap.add_argument("--motion-root-mode", choices=["velocity", "zero", "absolute"], default="velocity",
-                    help="Mode 4 root command: velocity uses frame-to-frame root velocity, zero disables root xy, absolute sends root position")
+                    help="Mode 4/5 root command: velocity uses frame-to-frame root velocity, zero disables root xy, absolute sends root position")
     ap.add_argument("-r", "--record", action="store_true",
                     help="Record camera video in mode 0 (default camera index 0)")
     args = ap.parse_args()
     if args.hz is None:
-        args.hz = 0.0 if args.mode == 4 else 30.0
+        args.hz = 0.0 if args.mode in (4, 5) else 30.0
     print_every = max(1, int(args.hz))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1142,6 +1232,68 @@ def main():
                         f"RH=({right[0]:+.3f},{right[1]:+.3f},{right[2]:+.3f}) "
                         f"LF=({lfoot[0]:+.3f},{lfoot[1]:+.3f},{lfoot[2]:+.3f}) "
                         f"RF=({rfoot[0]:+.3f},{rfoot[1]:+.3f},{rfoot[2]:+.3f})   ",
+                        end="",
+                        flush=True,
+                    )
+
+                seq = (seq + 1) & 0xFFFFFFFF
+                frame = (frame + 1) % len(packets)
+        finally:
+            send_logger.close()
+
+        return
+
+    # =========== MODE 5: Replay motion npz as 5-keypoint + joint-target stream ===
+    if args.mode == 5:
+        motion_path = pathlib.Path(args.motion_file).expanduser()
+        packets, motion_fps, indices, body_names, joint_names = load_motion_packets_with_joint_targets(
+            motion_path,
+            body_index_override=args.motion_body_indices,
+            root_mode=args.motion_root_mode,
+        )
+        send_hz = args.hz if args.hz > 0 else motion_fps
+        period = 1.0 / send_hz
+        print(f"[teleop_dummy_udp_sender] MODE=5 (motion replay + joint target)")
+        print(f"[motion] file: {motion_path}")
+        print(f"[motion] frames={len(packets)}, motion_fps={motion_fps:.3f}, send_hz={send_hz:.3f}")
+        print(f"[motion] root_mode={args.motion_root_mode}")
+        print(f"[motion] body indices: {indices}")
+        print(f"[motion] joint target future steps: {JOINT_TARGET_FUTURE_STEPS}")
+        print(f"[motion] joint order: {joint_names}")
+        print("[packet] magic=G6J1, root/head/left/right 28-float prefix + feet xyz_b 6 + joint_target 145")
+
+        send_logger = SignalSendLogger(mode=5, value_count=len(packets[0]))
+        print(f"[log] signal send log -> {send_logger.path}")
+
+        seq = 0
+        frame = 0
+        next_t = time.time()
+        try:
+            while True:
+                now = time.time()
+                if now < next_t:
+                    time.sleep(max(0.0, min(next_t - now, 0.01)))
+                    continue
+                next_t += period
+
+                floats = packets[frame]
+                pkt = make_packet_with_magic(seq, floats, magic=JOINT_MAGIC)
+                sock.sendto(pkt, (args.dst_ip, args.dst_port))
+                send_logger.log(t_sec=now, seq=seq, mode=5, values=floats)
+
+                if seq % print_every == 0:
+                    left = floats[14:17]
+                    right = floats[21:24]
+                    lfoot = floats[28:31]
+                    rfoot = floats[31:34]
+                    joint0 = floats[34:63]
+                    print(
+                        f"\r[seq={seq:6d} frame={frame:5d}/{len(packets)}] "
+                        f"LH=({left[0]:+.3f},{left[1]:+.3f},{left[2]:+.3f}) "
+                        f"RH=({right[0]:+.3f},{right[1]:+.3f},{right[2]:+.3f}) "
+                        f"LF=({lfoot[0]:+.3f},{lfoot[1]:+.3f},{lfoot[2]:+.3f}) "
+                        f"RF=({rfoot[0]:+.3f},{rfoot[1]:+.3f},{rfoot[2]:+.3f}) "
+                        f"J0=({min(joint0):+.3f},{max(joint0):+.3f})   ",
                         end="",
                         flush=True,
                     )

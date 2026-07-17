@@ -818,6 +818,34 @@ class MotionTrackingCommand(Command):
     def target_joint_pos_obs_sym(self):
         return sym_utils.joint_space_symmetry(self.asset, self.dataset.joint_names).repeat(len(self.future_steps))
 
+    def _resolve_future_step_indices(self, steps: Sequence[int] | None):
+        if steps is None:
+            return list(range(len(self.future_steps)))
+
+        future_steps = [int(step) for step in self.future_steps.detach().cpu().tolist()]
+        indices = []
+        for step in steps:
+            step = int(step)
+            if step in future_steps:
+                indices.append(future_steps.index(step))
+            elif 0 <= step < len(future_steps):
+                indices.append(step)
+            else:
+                raise ValueError(
+                    f"Requested future step {step} is not in future_steps={future_steps} "
+                    f"and is not a valid future-step index."
+                )
+        return indices
+
+    @observation
+    def target_joint_pos_steps_obs(self, steps: Sequence[int] | None = None):
+        step_indices = self._resolve_future_step_indices(steps)
+        joint_pos = self._motion.joint_pos[:, step_indices]
+        return joint_pos.reshape(self.num_envs, -1)
+    def target_joint_pos_steps_obs_sym(self, steps: Sequence[int] | None = None):
+        step_indices = self._resolve_future_step_indices(steps)
+        return sym_utils.joint_space_symmetry(self.asset, self.dataset.joint_names).repeat(len(step_indices))
+
     def _root_and_wrist_6d_from_motion(self):
         """
         Teleoperation observation: wrist 6D poses only (each 3 pos + 3 axis-angle) in ROOT frame.

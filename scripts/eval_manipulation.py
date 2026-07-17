@@ -278,6 +278,72 @@ def _direct_force_pred_b_from_tensordict(td, command_manager):
     return pred[..., 3:6] * max(force_limit, 1e-6)
 
 
+def _force_over_stiffness_offset_b(force_b: torch.Tensor, params: dict) -> torch.Tensor:
+    force_norm = force_b.norm(dim=-1, keepdim=True)
+    active_force = torch.where(
+        force_norm > params["force_deadband"],
+        force_b,
+        torch.zeros_like(force_b),
+    )
+    stiffness = _param_tensor(params["stiffness"], active_force.device)
+    max_offset = _param_tensor(params["max_offset"], active_force.device)
+    offset_b = active_force / stiffness
+    if max_offset.ndim > 0:
+        return torch.clamp(offset_b, min=-max_offset, max=max_offset)
+    return clamp_norm(offset_b, max=float(max_offset.item()))
+
+
+def _make_force_stiffness_ee_command(
+    reference_command: torch.Tensor,
+    nominal_target_b: torch.Tensor,
+    force_b: torch.Tensor,
+    params: dict,
+) -> torch.Tensor:
+    command = reference_command.clone()
+    offset_b = _force_over_stiffness_offset_b(force_b, params)
+    command[:, :6] = (nominal_target_b + offset_b).reshape(command.shape[0], 6)
+    return command
+
+
+def _set_ee_force_stiffness_ablation_from_policy_td(
+    action_manager,
+    command_manager,
+    policy_td,
+    reference_command: torch.Tensor,
+    nominal_target_b: torch.Tensor,
+    params: dict,
+):
+    if not hasattr(action_manager, "set_ee_force_stiffness_ablation_command"):
+        raise RuntimeError(
+            "EE force/stiffness ablation requires a hierarchical action manager with "
+            "set_ee_force_stiffness_ablation_command()."
+        )
+    force_pred_b = _direct_force_pred_b_from_tensordict(policy_td, command_manager)
+    if force_pred_b is None:
+        raise RuntimeError(
+            "EE force/stiffness ablation requires policy_td['direct_priv_pred']; "
+            "this checkpoint does not expose a direct force estimator."
+        )
+    force_pred_b = force_pred_b.to(device=nominal_target_b.device, dtype=torch.float32)
+    if force_pred_b.shape != (nominal_target_b.shape[0], 3):
+        raise RuntimeError(
+            f"Expected force estimator output shape {(nominal_target_b.shape[0], 3)}, "
+            f"got {tuple(force_pred_b.shape)}."
+        )
+
+    force_b = torch.zeros_like(nominal_target_b)
+    if getattr(command_manager, "eval_ee_force_enabled", False):
+        local_idx = getattr(command_manager, "eval_ee_force_body_local_idx", None)
+        if local_idx is not None and hasattr(command_manager, "net_pull_ee_idx_asset") and hasattr(command_manager, "net_pull_idx_asset"):
+            for ee_i, body_idx in enumerate(command_manager.net_pull_ee_idx_asset.detach().cpu().tolist()):
+                matches = (command_manager.net_pull_idx_asset == int(body_idx)).nonzero(as_tuple=False).flatten()
+                if matches.numel() > 0:
+                    mask = local_idx.to(device=force_b.device) == matches[0].to(device=force_b.device)
+                    force_b[mask, ee_i] = force_pred_b[mask]
+    command = _make_force_stiffness_ee_command(reference_command, nominal_target_b, force_b, params)
+    action_manager.set_ee_force_stiffness_ablation_command(command)
+
+
 def _get_ee_compliance_eval_info(command_manager, params: dict, use_command_manager_target: bool = True) -> dict:
     if (
         use_command_manager_target
@@ -859,9 +925,11 @@ def evaluate_ee_tracking(cfg, args):
         simulation_app.close()
 
 
-def _rollout_one_step(env, rollout_policy, td_, step_label: str, return_policy_td: bool = False):
+def _rollout_one_step(env, rollout_policy, td_, step_label: str, return_policy_td: bool = False, after_policy=None):
     td_ = rollout_policy(td_)
     policy_td = td_ if return_policy_td else None
+    if after_policy is not None:
+        after_policy(td_)
     td, td_ = env.step_and_maybe_reset(td_)
     _warn_if_done(td, step_label)
     if return_policy_td:
@@ -1347,18 +1415,45 @@ def evaluate_ee_compliance(cfg, args):
 
         compliance_params = _get_ee_compliance_params(cfg)
         _prompt_low_level_nominal_stiffness(compliance_params, command_manager, action_manager)
-        use_command_manager_compliance_target = _is_hierarchical_action_manager(action_manager)
+        force_estimator_ablation = bool(getattr(args, "ee_compliance_force_estimator_ablation", False))
+        if force_estimator_ablation and not _is_hierarchical_action_manager(action_manager):
+            raise RuntimeError(
+                "--ee_compliance_force_estimator_ablation is only supported for hierarchical policies; "
+                "low-level-only EE compliance eval is intentionally not handled."
+            )
+        if force_estimator_ablation:
+            action_manager.clear_ee_force_stiffness_ablation_command()
+        use_command_manager_compliance_target = _is_hierarchical_action_manager(action_manager) and not force_estimator_ablation
         compliance_eval_info = _get_ee_compliance_eval_info(
             command_manager,
             compliance_params,
             use_command_manager_target=use_command_manager_compliance_target,
         )
+        if force_estimator_ablation:
+            compliance_eval_info["target_mode"] = "force_estimator_over_cfg_stiffness_ablation"
+            compliance_eval_info["actual_stiffness"] = compliance_params["stiffness"]
         mean_window_steps = min(_mean_window_steps(base_env), EE_COMPLIANCE_HOLD_STEPS)
         baseline_window_steps = min(mean_window_steps, EE_COMPLIANCE_BASELINE_STEPS)
 
+        def force_estimator_ablation_after_policy(policy_td):
+            if not force_estimator_ablation:
+                return
+            _set_ee_force_stiffness_ablation_from_policy_td(
+                action_manager,
+                command_manager,
+                policy_td,
+                default_command,
+                sample_center_b,
+                compliance_params,
+            )
+
         print(
             "EE compliance eval target is written as "
-            + ("high-level EE reference override." if _is_hierarchical_action_manager(action_manager) else "low-level EE command override."),
+            + (
+                "force-estimator/stiffness low-level EE command override."
+                if force_estimator_ablation
+                else ("high-level EE reference override." if _is_hierarchical_action_manager(action_manager) else "low-level EE command override.")
+            ),
             flush=True,
         )
         print(
@@ -1369,6 +1464,12 @@ def evaluate_ee_compliance(cfg, args):
             f"force_deadband={compliance_params['force_deadband']}",
             flush=True,
         )
+        if force_estimator_ablation:
+            print(
+                "EE compliance force-estimator ablation enabled: high-level EE delta is bypassed; "
+                "low-level EE command position = nominal + direct_priv_pred_force_b / cfg stiffness.",
+                flush=True,
+            )
         print(
             f"Starting EE compliance sweep... mean_window_steps={mean_window_steps}, "
             f"baseline_window_steps={baseline_window_steps}",
@@ -1395,14 +1496,26 @@ def evaluate_ee_compliance(cfg, args):
         with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
             command_manager.clear_eval_ee_force()
             for _ in range(EE_TRACKING_WARMUP_STEPS):
-                _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance warmup")
+                _, td_ = _rollout_one_step(
+                    env,
+                    rollout_policy,
+                    td_,
+                    "compliance warmup",
+                    after_policy=force_estimator_ablation_after_policy,
+                )
 
             baseline_pos_samples = []
             baseline_quat_samples = []
             baseline_compliance_target_samples = []
             for step in range(EE_COMPLIANCE_BASELINE_STEPS):
                 command_manager.clear_eval_ee_force()
-                _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance baseline")
+                _, td_ = _rollout_one_step(
+                    env,
+                    rollout_policy,
+                    td_,
+                    "compliance baseline",
+                    after_policy=force_estimator_ablation_after_policy,
+                )
                 if step >= EE_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
                     sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
                     sample_compliance_target_b, _, _ = _compute_ee_compliance_target_b(
@@ -1442,14 +1555,26 @@ def evaluate_ee_compliance(cfg, args):
                 _set_ee_eval_target(command_manager, action_manager, default_command)
 
                 for _ in range(EE_TRACKING_WARMUP_STEPS):
-                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance warmup")
+                    _, td_ = _rollout_one_step(
+                        env,
+                        rollout_policy,
+                        td_,
+                        "compliance warmup",
+                        after_policy=force_estimator_ablation_after_policy,
+                    )
 
                 baseline_pos_samples = []
                 baseline_quat_samples = []
                 baseline_compliance_target_samples = []
                 for step in range(EE_COMPLIANCE_BASELINE_STEPS):
                     command_manager.clear_eval_ee_force()
-                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance baseline")
+                    _, td_ = _rollout_one_step(
+                        env,
+                        rollout_policy,
+                        td_,
+                        "compliance baseline",
+                        after_policy=force_estimator_ablation_after_policy,
+                    )
                     if step >= EE_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
                         sample_pos_b, sample_quat_b = _body_pose_in_root_frame(asset, body_ids)
                         sample_compliance_target_b, _, _ = _compute_ee_compliance_target_b(
@@ -1471,7 +1596,13 @@ def evaluate_ee_compliance(cfg, args):
 
                 for _ in range(EE_COMPLIANCE_RECOVERY_STEPS):
                     command_manager.clear_eval_ee_force()
-                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance recovery")
+                    _, td_ = _rollout_one_step(
+                        env,
+                        rollout_policy,
+                        td_,
+                        "compliance recovery",
+                        after_policy=force_estimator_ablation_after_policy,
+                    )
 
                 for ramp_step in range(EE_COMPLIANCE_RAMP_STEPS):
                     ramp_forces = torch.zeros(active_envs, 3, device=base_env.device)
@@ -1484,7 +1615,13 @@ def evaluate_ee_compliance(cfg, args):
                         if mask.any():
                             force_b = ramp_forces[mask]
                             command_manager.set_eval_ee_force_b(ee_i, force_b, env_ids=env_ids[mask])
-                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "compliance ramp")
+                    _, td_ = _rollout_one_step(
+                        env,
+                        rollout_policy,
+                        td_,
+                        "compliance ramp",
+                        after_policy=force_estimator_ablation_after_policy,
+                    )
 
                 pos_samples = [[] for _ in range(active_envs)]
                 quat_samples = [[] for _ in range(active_envs)]
@@ -1509,6 +1646,7 @@ def evaluate_ee_compliance(cfg, args):
                         td_,
                         "compliance hold",
                         return_policy_td=True,
+                        after_policy=force_estimator_ablation_after_policy,
                     )
                     if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
                         direct_force_pred_b = _direct_force_pred_b_from_tensordict(policy_td, command_manager)
@@ -1788,6 +1926,7 @@ def evaluate_ee_compliance(cfg, args):
             "mean_window_steps": mean_window_steps,
             "external_force": "manual_default",
             "external_force_default_cfg": DEFAULT_EXTERNAL_FORCE_CFG,
+            "ee_compliance_force_estimator_ablation": force_estimator_ablation,
             "target_pos_b": sample_center_b.detach().cpu().tolist(),
             "baseline_pos_b": baseline_pos_b.detach().cpu().tolist(),
             "baseline_nominal_error_m": baseline_nominal_error.detach().cpu().tolist(),
@@ -1869,7 +2008,12 @@ def evaluate_ee_compliance(cfg, args):
         }
 
         if args.ee_output is None:
-            args.ee_output = _default_ee_report_path(args, "ee_compliance_eval")
+            report_prefix = (
+                "ee_compliance_eval_force_estimator_ablation"
+                if force_estimator_ablation
+                else "ee_compliance_eval"
+            )
+            args.ee_output = _default_ee_report_path(args, report_prefix)
         os.makedirs(os.path.dirname(args.ee_output) or ".", exist_ok=True)
         with open(args.ee_output, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
@@ -1955,11 +2099,24 @@ def main():
                         help="External force mode: on uses run cfg, off disables it, default loads the shared eval force cfg")
     parser.add_argument("--ee_output", type=str, default=None, help="Path to write EE tracking JSON report")
     parser.add_argument("--root_output", type=str, default=None, help="Path to write root compliance JSON report")
+    parser.add_argument(
+        "--ee_compliance_force_estimator_ablation",
+        "--ee-compliance-force-estimator-ablation",
+        action="store_true",
+        default=False,
+        help=(
+            "Only with --ee_compliance_eval: bypass the high-level EE delta output and send "
+            "delta_x = force_estimator_b / cfg stiffness to the low-level policy."
+        ),
+    )
     args = parser.parse_args()
 
     eval_modes = [args.ee_tracking_eval, args.ee_compliance_eval, args.root_compliance_eval]
     if sum(bool(mode) for mode in eval_modes) > 1:
         print("Error: --ee_tracking_eval, --ee_compliance_eval, and --root_compliance_eval are mutually exclusive.")
+        sys.exit(1)
+    if args.ee_compliance_force_estimator_ablation and not args.ee_compliance_eval:
+        print("Error: --ee_compliance_force_estimator_ablation can only be used with --ee_compliance_eval.")
         sys.exit(1)
 
     # Determine checkpoint source

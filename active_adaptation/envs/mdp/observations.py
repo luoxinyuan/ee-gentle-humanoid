@@ -105,10 +105,14 @@ def observation_func(func):
 
 def observation_wrapper(func: Callable[[], torch.Tensor], func_sym: Callable):
     class ObservationWrapper(Observation):
+        def __init__(self, env, **params):
+            super().__init__(env)
+            self.params = params
+
         def compute(self):
-            return func()
+            return func(**self.params)
         def symmetry_transforms(self):
-            return func_sym()
+            return func_sym(**self.params)
     return ObservationWrapper
 
 class root_ang_vel_history(Observation):
