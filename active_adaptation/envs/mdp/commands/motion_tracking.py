@@ -3128,6 +3128,19 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         ])
 
     @observation
+    def net_pull_ee_force_b_priv(self):
+        """Per-hand net-pull force in the root frame: [left xyz, right xyz]."""
+        force_scale = max(self.net_pull_force_range[1], 1e-6)
+        return (self.net_pull_ee_force_b / force_scale).reshape(self.num_envs, -1)
+
+    def net_pull_ee_force_b_priv_sym(self):
+        return sym_utils.cartesian_space_symmetry(
+            self.asset,
+            self.net_pull_ee_names,
+            sign=[1, -1, 1],
+        )
+
+    @observation
     def net_pull_force_priv(self):
         body_one_hot = torch.zeros(self.num_envs, self.net_pull_num_bodies, device=self.device)
         body_one_hot.scatter_(1, self.net_pull_body_local_idx.unsqueeze(1), 1.0)

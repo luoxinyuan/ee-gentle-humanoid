@@ -5,7 +5,7 @@ LOW_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid"
 HL_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid_high_level"
 HL_WANDB_PROJECT="gentle_humanoid_high_level"
 CUDA_VISIBLE_DEVICES="4,5,6,7"
-MASTER_PORT="29501"
+MASTER_PORT="29508"
 NPROC="4"
 LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30"
 
@@ -58,7 +58,18 @@ run_pipeline() {
     "run:${HL_PROJECT_PATH}/${teacher_run_id}"
 }
 
-run_pipeline "G1/G1_hl_ee_x_compliance_pos_delta_student" "ee_200x_3kp_force_limit_stu"
-run_pipeline "G1/G1_hl_ee_y_compliance_pos_delta_student" "ee_200y_3kp_force_limit_stu"
-run_pipeline "G1/G1_hl_ee_z_compliance_pos_delta_student" "ee_200z_3kp_force_limit_stu"
-run_pipeline "G1/G1_hl_ee_xyz_compliance_pos_delta_student" "ee_200xyz_3kp_force_limit_stu"
+run_pipeline \
+  "G1/G1_hl_ee_x_compliance_pos_delta_force_b_student" \
+  "ee_200x_3kp_force_b_stu"
+
+run_pipeline \
+  "G1/G1_hl_ee_y_compliance_pos_delta_force_b_student" \
+  "ee_200y_3kp_force_b_stu"
+
+run_pipeline \
+  "G1/G1_hl_ee_z_compliance_pos_delta_force_b_student" \
+  "ee_200z_3kp_force_b_stu"
+
+run_pipeline \
+  "G1/G1_hl_ee_xyz_compliance_pos_delta_force_b_student" \
+  "ee_200_3kp_force_b_stu"

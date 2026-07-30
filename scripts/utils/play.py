@@ -69,6 +69,20 @@ def _print_hl_direct_priv_pred(tensordict, env, env_idx: int = 0):
             force_scale = 1.0
 
     env_idx = min(env_idx, pred.shape[0] - 1)
+    if pred.shape[-1] == 6:
+        force_slots_b = pred[env_idx].reshape(2, 3) * force_scale
+        left_force_b, right_force_b = force_slots_b
+        print(
+            "[HL direct_priv_pred] "
+            f"left_force_b_est: {left_force_b.norm().item():.2f} N "
+            f"({left_force_b[0].item():+.1f}, {left_force_b[1].item():+.1f}, {left_force_b[2].item():+.1f})"
+            " | "
+            f"right_force_b_est: {right_force_b.norm().item():.2f} N "
+            f"({right_force_b[0].item():+.1f}, {right_force_b[1].item():+.1f}, {right_force_b[2].item():+.1f})",
+            flush=True,
+        )
+        return
+
     force_b = pred[env_idx, 3:6] * force_scale
     msg = (
         f"[HL direct_priv_pred] force_b_est: {force_b.norm().item():.2f} N "

@@ -275,6 +275,26 @@ def _direct_force_pred_b_from_tensordict(td, command_manager):
     if pred.shape[-1] < 6:
         return None
     force_limit = float(getattr(command_manager, "net_pull_force_range", (1.0, 1.0))[1])
+
+    # EE-only force estimators use [left_force_b, right_force_b]. Select the
+    # slot for the currently loaded hand so legacy eval records stay 3-D.
+    if pred.shape[-1] == 6:
+        force_slots_b = pred.reshape(*pred.shape[:-1], 2, 3)
+        if (
+            pred.ndim == 2
+            and hasattr(command_manager, "net_pull_idx_asset")
+            and hasattr(command_manager, "net_pull_body_local_idx")
+            and hasattr(command_manager, "net_pull_ee_idx_asset")
+        ):
+            body_idx = command_manager.net_pull_idx_asset[command_manager.net_pull_body_local_idx]
+            ee_match = body_idx.unsqueeze(-1) == command_manager.net_pull_ee_idx_asset.unsqueeze(0)
+            if ee_match.any(dim=-1).all():
+                ee_idx = ee_match.int().argmax(dim=-1)
+                env_idx = torch.arange(pred.shape[0], device=pred.device)
+                return force_slots_b[env_idx, ee_idx] * max(force_limit, 1e-6)
+        return force_slots_b.sum(dim=-2) * max(force_limit, 1e-6)
+
+    # Legacy net_pull_force_priv layout: point_b[0:3], force_b[3:6], ...
     return pred[..., 3:6] * max(force_limit, 1e-6)
 
 
