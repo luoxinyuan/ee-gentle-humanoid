@@ -8,12 +8,10 @@ MASTER_PORT="${MASTER_PORT:-29502}"
 NPROC="${NPROC:-3}"
 
 ALGO="root_ppo"
-TASK="G1/G1_hl_force_walk"
+TASK="G1/G1_hl_force_walk_B200"
 LOW_RUN_PATH="${LOW_RUN_PATH:-${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30}"
-ROOT_DAMPING="${ROOT_DAMPING:-200}"
-DAMPING_TAG="${ROOT_DAMPING//./p}"
-# 命名方式: task_stiff_lowlevel_priv
-RUN_NAME="force_walk_vel_delta_3kp_priv_B${DAMPING_TAG}"
+# Canonical root-residual locomotion compliance task.
+RUN_NAME="force_walk_vel_delta_3kp_priv_B200"
 RUN_ID="${RUN_NAME}_$(date +%Y%m%d_%H%M%S)"
 
 export CUDA_VISIBLE_DEVICES
@@ -22,7 +20,6 @@ cmd=(torchrun --nproc_per_node="$NPROC" --master_port="$MASTER_PORT" scripts/tra
   task="$TASK"
   algo="$ALGO"
   task.action.low_policy.run_path="$LOW_RUN_PATH"
-  task.reward.root_hold.root_force_velocity_tracking.damping="$ROOT_DAMPING"
   wandb.project="$HL_WANDB_PROJECT"
   wandb.id="$RUN_ID"
 )

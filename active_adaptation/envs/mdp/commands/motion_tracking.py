@@ -3141,6 +3141,33 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         )
 
     @observation
+    def net_pull_force_b_priv(self):
+        """Compact root-frame net-pull force plus the active body identity."""
+        force_scale = max(self.net_pull_force_range[1], 1e-6)
+        body_one_hot = torch.zeros(self.num_envs, self.net_pull_num_bodies, device=self.device)
+        body_one_hot.scatter_(1, self.net_pull_body_local_idx.unsqueeze(1), 1.0)
+
+        # Do not expose a stale body identity during the rest/no-force phase.
+        active = (self.net_pull_force_b.norm(dim=-1, keepdim=True) > 1e-6).float()
+        body_one_hot = body_one_hot * active
+        return torch.cat([
+            self.net_pull_force_b / force_scale,
+            body_one_hot,
+        ], dim=-1)
+
+    def net_pull_force_b_priv_sym(self):
+        body_names = get_items_by_index(self.asset.body_names, self.net_pull_idx_asset)
+        symmetry_mapping = self.asset.cfg.spatial_symmetry_mapping
+        body_perm = torch.zeros(len(body_names), dtype=torch.long)
+        for i, body_name in enumerate(body_names):
+            body_perm[i] = body_names.index(symmetry_mapping[body_name])
+
+        return sym_utils.SymmetryTransform.cat([
+            sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, -1, 1]),
+            sym_utils.SymmetryTransform(perm=body_perm, signs=torch.ones(len(body_names))),
+        ])
+
+    @observation
     def net_pull_force_priv(self):
         body_one_hot = torch.zeros(self.num_envs, self.net_pull_num_bodies, device=self.device)
         body_one_hot.scatter_(1, self.net_pull_body_local_idx.unsqueeze(1), 1.0)

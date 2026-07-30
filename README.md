@@ -128,11 +128,14 @@ Common high-level end-to-end tasks:
 G1/G1_hl_root_hold
   High-level root command policy for holding root position.
 
-G1/G1_hl_force_resist
-  Root force-resist behavior.
+G1/G1_hl_force_walk_B60
+  Root residual locomotion compliance with target damping B=60.
 
-G1/G1_hl_force_walk
-  Root force-follow/walk behavior.
+G1/G1_hl_force_walk_B200
+  Root residual locomotion compliance with target damping B=200.
+
+G1/G1_hl_force_walk_B1000
+  Root residual locomotion compliance with target damping B=1000.
 
 G1/G1_hl_ee_compliance_pos_delta
   EE compliance with 6D residual xyz EE action.
@@ -190,8 +193,12 @@ G1/G1_hl_ee_y_compliance_pos_delta_student
     stiffness: [600, 200, 600]
     max_offset: [0.05, 0.25, 0.05]
 
-G1/G1_hl_force_walk_feet_student
-  Root + feet high-level action space for force-walk behavior.
+G1/G1_hl_force_walk_B60_force_b_student
+G1/G1_hl_force_walk_B200_force_b_student
+G1/G1_hl_force_walk_B1000_force_b_student
+  Root residual locomotion compliance with a compact force estimator.
+  The estimator predicts root-frame force xyz plus the active force-body one-hot.
+
 ```
 
 ## Notes

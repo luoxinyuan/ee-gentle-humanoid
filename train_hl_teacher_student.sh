@@ -59,17 +59,13 @@ run_pipeline() {
 }
 
 run_pipeline \
-  "G1/G1_hl_ee_x_compliance_pos_delta_force_b_student" \
-  "ee_200x_3kp_force_b_stu"
+  "G1/G1_hl_force_walk_B60_force_b_student" \
+  "force_walk_B60_3kp_force_b_stu"
 
 run_pipeline \
-  "G1/G1_hl_ee_y_compliance_pos_delta_force_b_student" \
-  "ee_200y_3kp_force_b_stu"
+  "G1/G1_hl_force_walk_B200_force_b_student" \
+  "force_walk_B200_3kp_force_b_stu"
 
 run_pipeline \
-  "G1/G1_hl_ee_z_compliance_pos_delta_force_b_student" \
-  "ee_200z_3kp_force_b_stu"
-
-run_pipeline \
-  "G1/G1_hl_ee_xyz_compliance_pos_delta_force_b_student" \
-  "ee_200_3kp_force_b_stu"
+  "G1/G1_hl_force_walk_B1000_force_b_student" \
+  "force_walk_B1000_3kp_force_b_stu"
