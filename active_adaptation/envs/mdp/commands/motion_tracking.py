@@ -1242,7 +1242,13 @@ class MotionTrackingCommand(Command):
         root_quat = self.asset.data.root_quat_w.unsqueeze(1)                 # [N, 1, 4]
         actual_wrist_b = quat_apply_inverse(root_quat, actual_wrist_w - root_pos)  # [N, 2, 3]
 
-        if getattr(self, "compliance", False) and hasattr(self, "force_keypoint_w"):
+        if (
+            getattr(self, "external_force_mode", "legacy") == "net_pull"
+            and getattr(self, "use_net_pull_ee_target_for_tracking", False)
+            and hasattr(self, "get_net_pull_ee_compliance_target_b")
+        ):
+            target_wrist_b = self.get_net_pull_ee_compliance_target_b().clone()
+        elif getattr(self, "compliance", False) and hasattr(self, "force_keypoint_w"):
             force_apply_idx_asset = self.force_apply_idx_asset.tolist()
             for wrist_i, asset_i in enumerate(wrist_idx_asset):
                 if asset_i in force_apply_idx_asset:
@@ -1668,8 +1674,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_margin_left_range: Sequence[Sequence[float]] | None = None,
         net_pull_margin_right_range: Sequence[Sequence[float]] | None = None,
         net_pull_ee_compliance_stiffness: float = 200.0,
+        net_pull_ee_compliance_stiffness_range: Sequence[float] | None = None,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
+        use_net_pull_ee_target_for_tracking: bool = False,
         external_force_enabled: bool = True,
         force_apply_pattern: Sequence[str] | None = None,
         force_active_pattern: Sequence[str] | None = None,
@@ -1901,6 +1909,25 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         )
         self.net_pull_ee_compliance_directional = stiffness_directional or offset_directional
         self.net_pull_ee_compliance_force_deadband = float(net_pull_ee_compliance_force_deadband)
+        self.net_pull_ee_compliance_stiffness_range = None
+        if net_pull_ee_compliance_stiffness_range is not None:
+            if len(net_pull_ee_compliance_stiffness_range) != 2:
+                raise ValueError(
+                    "net_pull_ee_compliance_stiffness_range must be [min, max]."
+                )
+            stiffness_min, stiffness_max = map(float, net_pull_ee_compliance_stiffness_range)
+            if stiffness_min <= 0.0 or stiffness_max < stiffness_min:
+                raise ValueError(
+                    "net_pull_ee_compliance_stiffness_range must satisfy 0 < min <= max."
+                )
+            self.net_pull_ee_compliance_stiffness_range = (stiffness_min, stiffness_max)
+        self.net_pull_ee_compliance_stiffness_current = torch.empty(
+            self.num_envs, 1, 3, dtype=torch.float32, device=self.device
+        )
+        self._set_net_pull_ee_compliance_stiffness_fixed()
+        # Keep the legacy EE reward target by default. New net-pull baselines
+        # can opt into the same compliance target used by high-level rewards.
+        self.use_net_pull_ee_target_for_tracking = bool(use_net_pull_ee_target_for_tracking)
 
         self.configure_admittance()
         self.configure_net_pull()
@@ -1993,6 +2020,30 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.net_pull_ee_compliance_target_b = torch.zeros(self.num_envs, 2, 3, dtype=torch.float32)
             self.net_pull_ee_force_b = torch.zeros(self.num_envs, 2, 3, dtype=torch.float32)
 
+    def _set_net_pull_ee_compliance_stiffness_fixed(self, env_ids=None):
+        if self.net_pull_ee_compliance_stiffness.ndim == 0:
+            fixed = self.net_pull_ee_compliance_stiffness.reshape(1, 1, 1).expand(-1, -1, 3)
+        else:
+            fixed = self.net_pull_ee_compliance_stiffness.reshape(1, 1, 3)
+        if env_ids is None:
+            self.net_pull_ee_compliance_stiffness_current[:] = fixed
+        else:
+            self.net_pull_ee_compliance_stiffness_current[env_ids] = fixed
+
+    def _sample_net_pull_ee_compliance_stiffness(self, env_ids):
+        if self.net_pull_ee_compliance_stiffness_range is None:
+            self._set_net_pull_ee_compliance_stiffness_fixed(env_ids)
+            return
+        stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_range
+        sampled = torch.empty(env_ids.numel(), 1, 1, device=self.device).uniform_(
+            stiffness_min, stiffness_max
+        )
+        self.net_pull_ee_compliance_stiffness_current[env_ids] = sampled.expand(-1, 1, 3)
+
+    def get_net_pull_ee_compliance_stiffness(self):
+        """Return the active isotropic EE stiffness as [env, 1, xyz]."""
+        return self.net_pull_ee_compliance_stiffness_current
+
     def _net_pull_ee_nominal_from_motion(self):
         if hasattr(self, "get_root_and_wrist_6d_reference"):
             reference = self.get_root_and_wrist_6d_reference()
@@ -2038,7 +2089,12 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                 v0_b=nominal_vel_b[self.last_reset_env_ids],
             )
 
-        stiffness = self.net_pull_ee_compliance_stiffness
+        if self.net_pull_ee_compliance_stiffness_range is None:
+            stiffness = self.net_pull_ee_compliance_stiffness
+        else:
+            # [1, env, 1, xyz] broadcasts over both hands while keeping
+            # one isotropic K per environment.
+            stiffness = self.net_pull_ee_compliance_stiffness_current.unsqueeze(0)
         mass = torch.as_tensor(self.net_pull_ee_admit.mass, device=self.device, dtype=torch.float32)
         damping = 2.0 * torch.sqrt(stiffness * mass)
 
@@ -2246,6 +2302,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     def sample_init(self, env_ids: torch.Tensor):
         super().sample_init(env_ids)
+        self._sample_net_pull_ee_compliance_stiffness(env_ids)
         self.force_reset(env_ids)
         return None
 
@@ -3126,6 +3183,18 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             sym_utils.cartesian_space_symmetry(self.asset,get_items_by_index(self.asset.body_names, self.force_apply_idx_asset), sign=[1, -1, 1]).repeat(3),
             sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1])
         ])
+
+    @observation
+    def net_pull_ee_compliance_stiffness_command(self):
+        """Normalized isotropic EE stiffness command in the range task."""
+        if self.net_pull_ee_compliance_stiffness_range is None:
+            return torch.zeros(self.num_envs, 1, device=self.device)
+        stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_range
+        stiffness = self.net_pull_ee_compliance_stiffness_current[:, 0, 0:1]
+        return 2.0 * (stiffness - stiffness_min) / (stiffness_max - stiffness_min) - 1.0
+
+    def net_pull_ee_compliance_stiffness_command_sym(self):
+        return sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1])
 
     @observation
     def net_pull_ee_force_b_priv(self):

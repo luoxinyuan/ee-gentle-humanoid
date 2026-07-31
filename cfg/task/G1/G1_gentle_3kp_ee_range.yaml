@@ -1,0 +1,13 @@
+name: G1GENTLE3KPEERANGE
+
+defaults:
+  - /task/G1/G1_gentle_3kp_ee_net_pull_force_b@_here_
+  - _self_
+
+command:
+  # Sample one scalar K per environment and use it for X/Y/Z.
+  net_pull_ee_compliance_stiffness_range: [200.0, 600.0]
+
+observation:
+  policy:
+    net_pull_ee_compliance_stiffness_command: {}
