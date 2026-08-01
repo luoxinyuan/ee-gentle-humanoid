@@ -259,6 +259,14 @@ def _prompt_low_level_nominal_stiffness(compliance_params: dict, command_manager
     )
 
 
+def _restore_low_level_eval_stiffness(compliance_params: dict, command_manager, action_manager) -> None:
+    """Restore a user-selected stiffness after a range-task environment reset."""
+    if _is_hierarchical_action_manager(action_manager):
+        return
+    if hasattr(command_manager, "set_net_pull_ee_compliance_stiffness"):
+        command_manager.set_net_pull_ee_compliance_stiffness(compliance_params["stiffness"])
+
+
 def _tensor_summary(value: torch.Tensor) -> dict:
     value = value.detach().float().reshape(-1).cpu()
     return {
@@ -558,6 +566,11 @@ def _set_ee_eval_target(command_manager, action_manager, command: torch.Tensor):
         _set_ee_reference(command_manager, command)
     else:
         _set_ee_command(command_manager, command)
+        # Low-level policies consume the command observation directly, while
+        # net-pull compliance targets use the reference path. Keep both paths
+        # anchored to the same evaluation target.
+        if hasattr(command_manager, "set_root_and_wrist_6d_reference_override"):
+            command_manager.set_root_and_wrist_6d_reference_override(command)
 
 
 def _get_hl_ee_command_pos_b(action_manager, env_ids: torch.Tensor | None = None):
@@ -1589,6 +1602,10 @@ def evaluate_ee_compliance(cfg, args):
                 command_manager.clear_eval_ee_force()
                 td_ = env.reset()
                 _disable_eval_timer_reset(base_env)
+                # Range-trained low-level tasks resample stiffness in
+                # sample_init(). Restore the value entered for this eval
+                # after every batch reset so policy input and target K agree.
+                _restore_low_level_eval_stiffness(compliance_params, command_manager, action_manager)
                 _set_static_root_command(command_manager, asset)
                 if _set_default_feet_command(command_manager, asset):
                     pass
