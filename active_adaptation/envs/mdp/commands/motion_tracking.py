@@ -2044,6 +2044,44 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         """Return the active isotropic EE stiffness as [env, 1, xyz]."""
         return self.net_pull_ee_compliance_stiffness_current
 
+    def set_net_pull_ee_compliance_stiffness(self, stiffness):
+        """Set the active EE compliance stiffness for all environments.
+
+        This is primarily used by evaluation to select a stiffness for a
+        range-trained policy. Fixed-stiffness policies keep their original
+        configuration path, while range-trained policies update both the
+        compliance target and the stiffness command observation.
+        """
+        parsed, directional = _parse_xyz_or_scalar(
+            stiffness,
+            name="net_pull_ee_compliance_stiffness",
+            device=self.device,
+        )
+        if self.net_pull_ee_compliance_stiffness_range is not None:
+            if directional:
+                values = parsed.reshape(-1)
+                if not torch.allclose(values, values[0].expand_as(values)):
+                    raise ValueError(
+                        "Range-trained EE compliance policies require one isotropic stiffness value."
+                    )
+                value = float(values[0].item())
+            else:
+                value = float(parsed.item())
+            stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_range
+            if not stiffness_min <= value <= stiffness_max:
+                raise ValueError(
+                    "Requested EE stiffness must be within the configured range "
+                    f"[{stiffness_min}, {stiffness_max}], got {value}."
+                )
+            self.net_pull_ee_compliance_stiffness_current[:] = value
+            return
+
+        self.net_pull_ee_compliance_stiffness = parsed
+        self.net_pull_ee_compliance_directional = directional or (
+            self.net_pull_ee_compliance_max_offset.ndim > 0
+        )
+        self._set_net_pull_ee_compliance_stiffness_fixed()
+
     def _net_pull_ee_nominal_from_motion(self):
         if hasattr(self, "get_root_and_wrist_6d_reference"):
             reference = self.get_root_and_wrist_6d_reference()

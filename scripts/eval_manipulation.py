@@ -222,6 +222,13 @@ def _prompt_low_level_nominal_stiffness(compliance_params: dict, command_manager
     if _is_hierarchical_action_manager(action_manager):
         return
     default = compliance_params["stiffness"]
+    if hasattr(command_manager, "get_net_pull_ee_compliance_stiffness"):
+        active = command_manager.get_net_pull_ee_compliance_stiffness()[0, 0].detach().float().cpu()
+        if torch.allclose(active, active[0].expand_as(active)):
+            default = float(active[0].item())
+        else:
+            default = [float(v) for v in active.tolist()]
+        compliance_params["stiffness"] = default
     prompt = (
         "Low-level policy detected. Enter EE compliance nominal stiffness xyz "
         f"(default {_format_scalar_or_xyz(default)}), e.g. 600 or 200 600 200: "
@@ -238,7 +245,9 @@ def _prompt_low_level_nominal_stiffness(compliance_params: dict, command_manager
             )
         compliance_params["stiffness"] = float(values[0]) if len(values) == 1 else [float(v) for v in values]
         compliance_params["found_in_cfg"] = True
-    if hasattr(command_manager, "net_pull_ee_compliance_stiffness"):
+    if hasattr(command_manager, "set_net_pull_ee_compliance_stiffness"):
+        command_manager.set_net_pull_ee_compliance_stiffness(compliance_params["stiffness"])
+    elif hasattr(command_manager, "net_pull_ee_compliance_stiffness"):
         command_manager.net_pull_ee_compliance_stiffness = _param_tensor(
             compliance_params["stiffness"],
             command_manager.device,
@@ -372,7 +381,14 @@ def _get_ee_compliance_eval_info(command_manager, params: dict, use_command_mana
         and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
     ):
         actual_stiffness = params["stiffness"]
-        if hasattr(command_manager, "net_pull_ee_compliance_stiffness"):
+        if hasattr(command_manager, "get_net_pull_ee_compliance_stiffness"):
+            stiffness_tensor = command_manager.get_net_pull_ee_compliance_stiffness()[0, 0].detach().float().cpu()
+            actual_stiffness = (
+                float(stiffness_tensor[0].item())
+                if torch.allclose(stiffness_tensor, stiffness_tensor[0].expand_as(stiffness_tensor))
+                else [float(v) for v in stiffness_tensor.tolist()]
+            )
+        elif hasattr(command_manager, "net_pull_ee_compliance_stiffness"):
             stiffness_tensor = command_manager.net_pull_ee_compliance_stiffness.detach().float().reshape(-1).cpu()
             actual_stiffness = (
                 float(stiffness_tensor.item())
@@ -1443,7 +1459,11 @@ def evaluate_ee_compliance(cfg, args):
             )
         if force_estimator_ablation:
             action_manager.clear_ee_force_stiffness_ablation_command()
-        use_command_manager_compliance_target = _is_hierarchical_action_manager(action_manager) and not force_estimator_ablation
+        use_command_manager_compliance_target = (
+            not force_estimator_ablation
+            and getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
+            and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
+        )
         compliance_eval_info = _get_ee_compliance_eval_info(
             command_manager,
             compliance_params,
