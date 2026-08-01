@@ -1678,6 +1678,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
         use_net_pull_ee_target_for_tracking: bool = False,
+        sync_net_pull_ee_reward_targets: bool = False,
         external_force_enabled: bool = True,
         force_apply_pattern: Sequence[str] | None = None,
         force_active_pattern: Sequence[str] | None = None,
@@ -1928,6 +1929,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         # Keep the legacy EE reward target by default. New net-pull baselines
         # can opt into the same compliance target used by high-level rewards.
         self.use_net_pull_ee_target_for_tracking = bool(use_net_pull_ee_target_for_tracking)
+        self.sync_net_pull_ee_reward_targets = bool(sync_net_pull_ee_reward_targets)
 
         self.configure_admittance()
         self.configure_net_pull()
@@ -2162,6 +2164,48 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     def get_net_pull_ee_compliance_target_b(self):
         return self.net_pull_ee_compliance_target_b
+
+    def sync_net_pull_ee_reward_target_buffers(self):
+        """Bridge net-pull compliance targets into legacy impedance rewards.
+
+        The original impedance rewards consume ``force_keypoint_w`` and
+        ``force_keypoint_vel_w``. Net-pull writes the applied force and point
+        through a separate path, so those legacy buffers would otherwise stay
+        stale. This bridge is opt-in for the new EE baseline tasks only.
+        """
+        if not self.sync_net_pull_ee_reward_targets:
+            return
+        if self.external_force_mode != "net_pull":
+            return
+
+        root_pos_w = self.asset.data.root_pos_w.unsqueeze(1)
+        root_quat_w = self.asset.data.root_quat_w.unsqueeze(1)
+        target_b = self.net_pull_ee_compliance_target_b
+        target_w = quat_apply(root_quat_w.expand(-1, target_b.shape[1], -1), target_b) + root_pos_w
+
+        # Keep any non-net-pull force slots at their nominal motion targets.
+        nominal_w = self.reward_keypoints_w[:, self.force_apply_idx_motion]
+        self.force_keypoint_w[:] = nominal_w
+        self.force_keypoint_b[:] = quat_apply_inverse(
+            root_quat_w.expand(-1, nominal_w.shape[1], -1),
+            nominal_w - root_pos_w,
+        )
+
+        # Replace the hand slots with the dynamic compliance target.
+        for ee_i, asset_i in enumerate(self.net_pull_ee_idx_asset.tolist()):
+            matches = (self.force_apply_idx_asset == int(asset_i)).nonzero(as_tuple=False).flatten()
+            if matches.numel() == 0:
+                continue
+            slot = int(matches[0].item())
+            self.force_keypoint_w[:, slot] = target_w[:, ee_i]
+            self.force_keypoint_b[:, slot] = target_b[:, ee_i]
+
+        if self.last_reset_env_ids is not None:
+            self.force_keypoint_w_prev[self.last_reset_env_ids] = self.force_keypoint_w[self.last_reset_env_ids]
+        self.force_keypoint_vel_w[:] = (
+            self.force_keypoint_w - self.force_keypoint_w_prev
+        ) / self.env.step_dt
+        self.force_keypoint_w_prev[:] = self.force_keypoint_w
 
     def get_net_pull_ee_nominal_target_b(self):
         return self.net_pull_ee_nominal_target_b
@@ -2950,6 +2994,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.net_pull_schedule()
             self.net_pull_update_target()
             self.update_net_pull_ee_compliance_target()
+            self.sync_net_pull_ee_reward_target_buffers()
         elif self.compliance:
             self.force_kp_tl.update_time()
             self.force_origin_tl.update_time()

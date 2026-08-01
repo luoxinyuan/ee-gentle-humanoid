@@ -1,0 +1,13 @@
+name: G1GENTLE3KPSTIFFJOINT02
+
+defaults:
+  - /task/G1/G1_gentle_3kp_stiff@_here_
+  - _self_
+
+observation:
+  joint_target:
+    # Teacher/student joint target uses only the current reference and the
+    # short-horizon 2-step preview. Other command observations still use the
+    # default future_steps [0, 2, 4, 8, 16].
+    target_joint_pos_obs: {enabled: false}
+    target_joint_pos_steps_obs: {steps: [0, 2]}

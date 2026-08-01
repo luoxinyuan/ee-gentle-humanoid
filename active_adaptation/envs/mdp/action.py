@@ -182,6 +182,7 @@ class HierarchicalRootCommand(ActionManager):
         root_command: Dict | None = None,
         ee_command: Dict | None = None,
         feet_command: Dict | None = None,
+        joint_residual: Dict | None = None,
         low_policy_command_slice: Tuple[int, int] | None = (1, 7),
         low_policy_obs_key: str | None = "policy",
         override_root_command: bool = False,
@@ -222,7 +223,23 @@ class HierarchicalRootCommand(ActionManager):
         self.feet_command_cfg = dict(feet_command or {})
         self.feet_command_enabled = self.feet_command_cfg.get("enabled", False)
         self.feet_command_dim = 6 if self.feet_command_enabled else 0
-        expected_command_dim = self.root_command_dim + self.ee_command_dim + self.feet_command_dim
+
+        # Instantiate the frozen low-level action manager before resolving the
+        # optional residual dimension. Its action order is the canonical G1
+        # joint order used by the low-level checkpoint.
+        self.low_action_manager: JointPosition = hydra.utils.instantiate(low_action, env=env)
+        self.joint_residual_cfg = dict(joint_residual or {})
+        self.joint_residual_enabled = self.joint_residual_cfg.get("enabled", False)
+        self.joint_residual_dim = (
+            self.low_action_manager.action_dim if self.joint_residual_enabled else 0
+        )
+
+        expected_command_dim = (
+            self.root_command_dim
+            + self.ee_command_dim
+            + self.feet_command_dim
+            + self.joint_residual_dim
+        )
         legacy_root_only_dim = 5
         valid_dims = {expected_command_dim}
         if self.root_command_enabled and not self.ee_command_enabled and not self.feet_command_enabled:
@@ -247,11 +264,22 @@ class HierarchicalRootCommand(ActionManager):
             self.feet_command_cfg.get("pos_scale", [0.15, 0.15, 0.08]),
             device=self.device,
         ).reshape(1, 1, 3)
+        residual_scale = self.joint_residual_cfg.get("scale", 0.05)
+        if isinstance(residual_scale, SequenceABC) and not isinstance(residual_scale, (str, bytes)):
+            if len(residual_scale) != self.joint_residual_dim:
+                raise ValueError(
+                    "HierarchicalRootCommand joint_residual.scale must have one value per low-level action "
+                    f"({self.joint_residual_dim}), got {len(residual_scale)}."
+                )
+            self.joint_residual_scale = torch.tensor(residual_scale, device=self.device).reshape(1, -1)
+        else:
+            self.joint_residual_scale = torch.full(
+                (1, self.joint_residual_dim), float(residual_scale), device=self.device
+            )
         self.low_policy_command_slice = tuple(low_policy_command_slice) if low_policy_command_slice is not None else None
         self.low_policy_obs_key = low_policy_obs_key
         self.override_root_command = override_root_command
 
-        self.low_action_manager: JointPosition = hydra.utils.instantiate(low_action, env=env)
         from active_adaptation.learning.hierarchical.frozen_low_level import FrozenLowLevelPolicy
         self.low_policy = FrozenLowLevelPolicy(
             env=env,
@@ -265,6 +293,9 @@ class HierarchicalRootCommand(ActionManager):
         self.ee_command = torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
         self.ee_command_buf = torch.zeros(self.num_envs, 3, self.ee_storage_dim, device=self.device)
         self.feet_command = torch.zeros(self.num_envs, self.feet_command_dim, device=self.device)
+        self.joint_residual = torch.zeros(
+            self.num_envs, self.joint_residual_dim, device=self.device
+        )
         self.low_action = torch.zeros(self.num_envs, self.low_action_manager.action_dim, device=self.device)
         self.ee_force_stiffness_ablation_enabled = False
         self.ee_force_stiffness_ablation_command = torch.zeros(self.num_envs, self.ee_storage_dim, device=self.device)
@@ -375,6 +406,7 @@ class HierarchicalRootCommand(ActionManager):
         self.high_action_buf[env_ids] = 0.0
         self.ee_command_buf[env_ids] = 0.0
         self.low_action[env_ids] = 0.0
+        self.joint_residual[env_ids] = 0.0
         self._reset_root_command(env_ids)
         self._reset_ee_command(env_ids)
         self._reset_feet_command(env_ids)
@@ -478,6 +510,13 @@ class HierarchicalRootCommand(ActionManager):
                 cursor += self.ee_command_dim
             if self.feet_command_enabled:
                 self.feet_command[:] = self._decode_feet_command(raw_action[:, cursor:cursor + self.feet_command_dim])
+                cursor += self.feet_command_dim
+            if self.joint_residual_enabled:
+                self.joint_residual[:] = (
+                    torch.tanh(raw_action[:, cursor:cursor + self.joint_residual_dim])
+                    * self.joint_residual_scale
+                )
+                cursor += self.joint_residual_dim
             if self.override_root_command:
                 self._set_default_root_command()
             if not hasattr(self.env.command_manager, "set_root_command"):
@@ -511,6 +550,8 @@ class HierarchicalRootCommand(ActionManager):
                 low_td["policy"][:, start:stop] = command
                 # low_td["policy"][:, stop:stop + 12] = torch.tensor([0.15, 0.1, 0.0, 0.15, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=self.device)
             self.low_action[:] = self.low_policy.act(low_td)
+            if self.joint_residual_enabled:
+                self.low_action.add_(self.joint_residual)
 
         low_td = tensordict.clone()
         low_td["action"] = self.low_action

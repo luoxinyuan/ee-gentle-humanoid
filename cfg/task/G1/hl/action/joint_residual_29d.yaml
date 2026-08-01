@@ -1,0 +1,16 @@
+defaults:
+  - /task/G1/hl/action/root_3kp@_here_
+  - _self_
+
+action:
+  # The high-level policy outputs only the residual. The low-level still
+  # receives the motion root reference through the passthrough command.
+  command_dim: 29
+  root_command:
+    enabled: false
+    passthrough_reference: true
+  joint_residual:
+    enabled: true
+    # Normalized low-level action units; JointPosition applies the existing
+    # per-joint action scaling after the residual is added.
+    scale: 0.05

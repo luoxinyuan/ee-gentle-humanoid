@@ -3,9 +3,9 @@ set -euo pipefail
 
 # ===== Global Configuration =====
 PROJECT="luoxinyuan-duke-university/gentle_humanoid"
-export CUDA_VISIBLE_DEVICES=0,1,2
-MASTER_PORT=29501
-NPROC=3
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+MASTER_PORT=29502
+NPROC=4
 SCRIPT="scripts/train.py"
 
 run_pipeline() {

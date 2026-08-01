@@ -1,0 +1,20 @@
+name: G1HLEE100COMPLIANCEPOSDELTASTUDENT
+
+defaults:
+  - /task/G1/G1_hl_ee_compliance_pos_delta_student@_here_
+  - _self_
+
+action:
+  ee_command:
+    # 100 N/m target with up to 30 N external force; keep the command range
+    # wide enough for the configured compliance offset.
+    pos_scale: [0.25, 0.25, 0.25]
+
+reward:
+  ee_compliance:
+    ee_force_compliance_tracking:
+      stiffness: [100.0, 100.0, 100.0]
+      max_offset: [0.25, 0.25, 0.25]
+    ee_force_limit_penalty:
+      stiffness: ${task.reward.ee_compliance.ee_force_compliance_tracking.stiffness}
+      force_limit: [15.0, 15.0, 15.0]

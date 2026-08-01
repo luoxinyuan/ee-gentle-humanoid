@@ -4,8 +4,8 @@ set -euo pipefail
 LOW_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid"
 HL_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid_high_level"
 HL_WANDB_PROJECT="gentle_humanoid_high_level"
-CUDA_VISIBLE_DEVICES="4,5,6,7"
-MASTER_PORT="29508"
+CUDA_VISIBLE_DEVICES="0,1,2,3"
+MASTER_PORT="29501"
 NPROC="4"
 LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30"
 

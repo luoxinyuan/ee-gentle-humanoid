@@ -1,0 +1,15 @@
+name: G1GENTLE3KPCOMPLIANCELIMMTLAFAN
+
+defaults:
+  - /task/G1/G1_gentle_3kp@_here_
+  - _self_
+
+command:
+  compliance: True
+  dataset:
+    mem_paths:
+      - limmt_no_foot_gentle_amass_full
+      - lafan_limmt_filtered
+    path_weights:
+      - 8.0
+      - 1.0

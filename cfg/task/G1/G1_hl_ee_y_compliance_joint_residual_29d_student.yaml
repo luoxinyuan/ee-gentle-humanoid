@@ -1,0 +1,31 @@
+name: G1HLEEYCOMPLIANCEJOINTRESIDUAL29DSTUDENT
+
+defaults:
+  - /task/G1/hl/base_student@_here_
+  - /task/G1/hl/action/joint_residual_29d@_here_
+  - /task/G1/hl/force/net_pull_ee@_here_
+  - /task/G1/hl/task/ee_compliance@_here_
+  - _self_
+
+observation:
+  # Required by root_student_force_ppo as the deploy-time force estimator
+  # target. The teacher sees this group directly; the student predicts it.
+  hl_force_priv:
+    net_pull_force_priv: {}
+  hl_priv:
+    net_pull_force_priv: {enabled: false}
+
+reward:
+  ee_compliance:
+    ee_force_compliance_tracking:
+      stiffness: [600.0, 200.0, 600.0]
+      max_offset: [0.05, 0.25, 0.05]
+    ee_force_limit_penalty:
+      force_limit: [30.0, 15.0, 30.0]
+  regularization:
+    # The existing high-level regularizers sum over action dimensions. These
+    # weights are reduced only for this 29D experiment, approximately scaling
+    # the previous 6D penalty by 6/29.
+    high_action_l2: {weight: 0.0041}
+    high_action_rate_l2: {weight: 0.0414}
+    high_action_rate2_l2: {weight: 0.0207}
