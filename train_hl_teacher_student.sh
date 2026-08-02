@@ -40,6 +40,8 @@ run_stage() {
 run_pipeline() {
   local task="$1"
   local run_name="$2"
+  local teacher_frames="$3"
+  local adapt_frames="$4"
 
   local teacher_run_id="${run_name}_teacher_${TIMESTAMP}"
   local adapt_run_id="${run_name}_adapt_${TIMESTAMP}"
@@ -48,28 +50,18 @@ run_pipeline() {
     "$task" \
     "root_student_force_ppo" \
     "$teacher_run_id" \
-    "4000_000_000"
+    "$teacher_frames"
 
   run_stage \
     "$task" \
     "root_student_force_ppo_adapt" \
     "$adapt_run_id" \
-    "1000_000_000" \
+    "$adapt_frames" \
     "run:${HL_PROJECT_PATH}/${teacher_run_id}"
 }
 
 run_pipeline \
-  "G1/G1_hl_ee_x400_compliance_pos_delta_force_b_student" \
-  "ee_400x_3kp_force_b_stu"
-
-run_pipeline \
-  "G1/G1_hl_ee_y400_compliance_pos_delta_force_b_student" \
-  "ee_400y_3kp_force_b_stu"
-
-run_pipeline \
-  "G1/G1_hl_ee_z400_compliance_pos_delta_force_b_student" \
-  "ee_400z_3kp_force_b_stu"
-
-run_pipeline \
-  "G1/G1_hl_ee_xyz600_compliance_pos_delta_force_b_student" \
-  "ee_600xyz_3kp_force_b_stu"
+  "G1/G1_hl_ee_xyz_range_200_600_force_b_student" \
+  "ee_xyz_range_200_600_3kp_force_b_stu" \
+  "8000_000_000" \
+  "2000_000_000"

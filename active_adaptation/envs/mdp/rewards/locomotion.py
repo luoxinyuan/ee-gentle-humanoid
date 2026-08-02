@@ -479,6 +479,7 @@ class ee_force_limit_penalty(Reward):
         force_limit: float | Sequence[float] = 30.0,
         force_deadband: float = 0.0,
         power: float = 1.0,
+        use_command_stiffness: bool = False,
         enabled: bool = True,
     ):
         super().__init__(env, weight, enabled)
@@ -495,6 +496,7 @@ class ee_force_limit_penalty(Reward):
         )
         self.force_deadband = float(force_deadband)
         self.power = float(power)
+        self.use_command_stiffness = bool(use_command_stiffness)
         if self.power <= 0.0:
             raise ValueError(f"ee_force_limit_penalty.power must be positive, got {power}.")
         self.ee_names = ["left_hand_mimic", "right_hand_mimic"]
@@ -559,7 +561,12 @@ class ee_force_limit_penalty(Reward):
         force_b = self._force_b(asset_idx)
         force_abs = force_b.abs()
         force_sign = torch.sign(force_b)
-        relief = (self.stiffness * target_offset_b * force_sign).clamp_min(0.0)
+        stiffness = self.stiffness
+        if self.use_command_stiffness and hasattr(command, "get_net_pull_ee_compliance_stiffness"):
+            # The command manager owns the sampled K for range-conditioned
+            # tasks. [env, 1, xyz] broadcasts over the two hands.
+            stiffness = command.get_net_pull_ee_compliance_stiffness()[:, 0:1, :]
+        relief = (stiffness * target_offset_b * force_sign).clamp_min(0.0)
         remaining_force = (force_abs - relief).clamp_min(0.0)
         remaining_force = torch.where(
             force_abs > self.force_deadband,

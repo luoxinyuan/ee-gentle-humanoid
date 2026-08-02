@@ -1,0 +1,18 @@
+name: G1HLEEXYZRANGE200600FORCEBSTUDENT
+
+defaults:
+  - /task/G1/G1_hl_ee_compliance_pos_delta_force_b_student@_here_
+  - /task/G1/hl/task/ee_compliance_xyz_range@_here_
+  - _self_
+
+reward:
+  ee_compliance:
+    ee_force_compliance_tracking:
+      # The command manager replaces this nominal value with the sampled
+      # per-environment [kx, ky, kz] during net-pull evaluation/training.
+      stiffness: [200.0, 200.0, 200.0]
+      max_offset: [0.25, 0.25, 0.25]
+    ee_force_limit_penalty:
+      stiffness: [200.0, 200.0, 200.0]
+      force_limit: [15.0, 15.0, 15.0]
+      use_command_stiffness: true

@@ -76,7 +76,12 @@ def _default_ee_report_path(args, prefix: str) -> str:
         policy_name = _safe_report_name(os.path.splitext(os.path.basename(args.checkpoint))[0])
     else:
         policy_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join("outputs", f"{prefix}_{policy_name}.json")
+    stiffness_values = getattr(args, "ee_compliance_stiffness", None)
+    stiffness_suffix = ""
+    if prefix.startswith("ee_compliance") and stiffness_values is not None:
+        stiffness_token = "_".join(f"{value:g}" for value in stiffness_values)
+        stiffness_suffix = f"_k{_safe_report_name(stiffness_token)}"
+    return os.path.join("outputs", f"{prefix}_{policy_name}{stiffness_suffix}.json")
 EE_COMPLIANCE_FORCE_DIRECTIONS = [
     ("+x", [1.0, 0.0, 0.0]),
     ("-x", [-1.0, 0.0, 0.0]),
@@ -265,6 +270,47 @@ def _restore_low_level_eval_stiffness(compliance_params: dict, command_manager, 
         return
     if hasattr(command_manager, "set_net_pull_ee_compliance_stiffness"):
         command_manager.set_net_pull_ee_compliance_stiffness(compliance_params["stiffness"])
+
+
+def _set_explicit_eval_stiffness(
+    stiffness_values: list[float] | None,
+    compliance_params: dict,
+    command_manager,
+) -> None:
+    """Set the active EE stiffness used by both the target model and policy obs.
+
+    Range-trained high-level policies read the active stiffness through the
+    ``net_pull_ee_compliance_stiffness_command`` observation.  The command
+    manager is therefore the single source of truth for both that observation
+    and the compliance target calculation.
+    """
+    if stiffness_values is None:
+        return
+    if len(stiffness_values) not in (1, 3):
+        raise ValueError(
+            "--ee_compliance_stiffness expects one isotropic value or three xyz values."
+        )
+    stiffness = float(stiffness_values[0]) if len(stiffness_values) == 1 else [float(v) for v in stiffness_values]
+    if not hasattr(command_manager, "set_net_pull_ee_compliance_stiffness"):
+        raise RuntimeError(
+            "--ee_compliance_stiffness requires a command manager with "
+            "set_net_pull_ee_compliance_stiffness()."
+        )
+    command_manager.set_net_pull_ee_compliance_stiffness(stiffness)
+    compliance_params["stiffness"] = stiffness
+    compliance_params["found_in_cfg"] = True
+
+
+def _restore_explicit_eval_stiffness(
+    stiffness_values: list[float] | None,
+    command_manager,
+) -> None:
+    """Reapply an explicitly requested stiffness after an environment reset."""
+    if stiffness_values is None:
+        return
+    stiffness = float(stiffness_values[0]) if len(stiffness_values) == 1 else [float(v) for v in stiffness_values]
+    if hasattr(command_manager, "set_net_pull_ee_compliance_stiffness"):
+        command_manager.set_net_pull_ee_compliance_stiffness(stiffness)
 
 
 def _tensor_summary(value: torch.Tensor) -> dict:
@@ -1464,6 +1510,11 @@ def evaluate_ee_compliance(cfg, args):
 
         compliance_params = _get_ee_compliance_params(cfg)
         _prompt_low_level_nominal_stiffness(compliance_params, command_manager, action_manager)
+        _set_explicit_eval_stiffness(
+            getattr(args, "ee_compliance_stiffness", None),
+            compliance_params,
+            command_manager,
+        )
         force_estimator_ablation = bool(getattr(args, "ee_compliance_force_estimator_ablation", False))
         if force_estimator_ablation and not _is_hierarchical_action_manager(action_manager):
             raise RuntimeError(
@@ -1606,6 +1657,13 @@ def evaluate_ee_compliance(cfg, args):
                 # sample_init(). Restore the value entered for this eval
                 # after every batch reset so policy input and target K agree.
                 _restore_low_level_eval_stiffness(compliance_params, command_manager, action_manager)
+                # Range-trained high-level tasks also resample stiffness on
+                # reset. Reapply an explicit eval value so the policy input,
+                # compliance target, and report all use the same K.
+                _restore_explicit_eval_stiffness(
+                    getattr(args, "ee_compliance_stiffness", None),
+                    command_manager,
+                )
                 _set_static_root_command(command_manager, asset)
                 if _set_default_feet_command(command_manager, asset):
                     pass
@@ -1936,12 +1994,27 @@ def evaluate_ee_compliance(cfg, args):
             if measured_stiffness
             else torch.empty(0, dtype=torch.float32)
         )
+        measured_stiffness_error_abs = [
+            abs(
+                r["measured_stiffness_abs_n_per_m"]
+                - r["cfg_stiffness_n_per_m"]
+            )
+            for r in records
+            if r["measured_stiffness_abs_n_per_m"] is not None
+            and r["cfg_stiffness_n_per_m"] is not None
+        ]
+        measured_stiffness_error_abs_tensor = (
+            torch.tensor(measured_stiffness_error_abs, dtype=torch.float32)
+            if measured_stiffness_error_abs
+            else torch.empty(0, dtype=torch.float32)
+        )
         hl_command_measured_stiffness_tensor = (
             torch.tensor(hl_command_measured_stiffness, dtype=torch.float32)
             if hl_command_measured_stiffness
             else torch.empty(0, dtype=torch.float32)
         )
         measured_stiffness_xyz = {}
+        measured_stiffness_error_xyz = {}
         hl_command_measured_stiffness_xyz = {}
         for axis in ("x", "y", "z"):
             axis_values = [
@@ -1955,6 +2028,24 @@ def evaluate_ee_compliance(cfg, args):
                 else torch.empty(0, dtype=torch.float32)
             )
             measured_stiffness_xyz[axis] = _summary(axis_tensor) if axis_tensor.numel() > 0 else None
+            axis_error_values = [
+                abs(
+                    r["measured_stiffness_abs_n_per_m"]
+                    - r["cfg_stiffness_n_per_m"]
+                )
+                for r in records
+                if r["direction"].endswith(axis)
+                and r["measured_stiffness_abs_n_per_m"] is not None
+                and r["cfg_stiffness_n_per_m"] is not None
+            ]
+            axis_error_tensor = (
+                torch.tensor(axis_error_values, dtype=torch.float32)
+                if axis_error_values
+                else torch.empty(0, dtype=torch.float32)
+            )
+            measured_stiffness_error_xyz[axis] = (
+                _summary(axis_error_tensor) if axis_error_tensor.numel() > 0 else None
+            )
             hl_axis_values = [
                 r["hl_command_measured_stiffness_abs_n_per_m"]
                 for r in records
@@ -2043,6 +2134,12 @@ def evaluate_ee_compliance(cfg, args):
                     else None
                 ),
                 "measured_stiffness_abs_xyz_n_per_m": measured_stiffness_xyz,
+                "measured_stiffness_error_abs_n_per_m": (
+                    _summary(measured_stiffness_error_abs_tensor)
+                    if measured_stiffness_error_abs_tensor.numel() > 0
+                    else None
+                ),
+                "measured_stiffness_error_abs_xyz_n_per_m": measured_stiffness_error_xyz,
                 "hl_command_measured_stiffness_abs_n_per_m": (
                     _summary(hl_command_measured_stiffness_tensor)
                     if hl_command_measured_stiffness_tensor.numel() > 0
@@ -2079,44 +2176,69 @@ def evaluate_ee_compliance(cfg, args):
         compliance = report["summary"]["compliance_position_error_m"]["combined"]
         stiffness_summary = report["summary"]["measured_stiffness_abs_n_per_m"]
         stiffness_xyz = report["summary"]["measured_stiffness_abs_xyz_n_per_m"]
+        stiffness_error_summary = report["summary"]["measured_stiffness_error_abs_n_per_m"]
+        stiffness_error_xyz = report["summary"]["measured_stiffness_error_abs_xyz_n_per_m"]
         force_estimator_summary = report["summary"].get("force_estimator")
         print("\n" + "=" * 60)
         print("EE COMPLIANCE EVAL")
         print("=" * 60)
-        print(f"  Nominal position error mean/rmse/max: {nominal['mean']:.4f} / {nominal['rmse']:.4f} / {nominal['max']:.4f} m")
         print(
-            "  Compliance position error mean/rmse/max: "
-            f"{compliance['mean']:.4f} / {compliance['rmse']:.4f} / {compliance['max']:.4f} m"
+            "  Nominal position error mean±std/rmse/max: "
+            f"{nominal['mean']:.4f} ± {nominal['std']:.4f} / "
+            f"{nominal['rmse']:.4f} / {nominal['max']:.4f} m"
+        )
+        print(
+            "  Compliance position error mean±std/rmse/max: "
+            f"{compliance['mean']:.4f} ± {compliance['std']:.4f} / "
+            f"{compliance['rmse']:.4f} / {compliance['max']:.4f} m"
         )
         if stiffness_summary is not None:
             print(
-                "  Measured nominal stiffness abs mean/min/max: "
-                f"{stiffness_summary['mean']:.1f} / {stiffness_summary['min']:.1f} / {stiffness_summary['max']:.1f} N/m"
+                "  Measured nominal stiffness abs mean±std/rmse/min/max: "
+                f"{stiffness_summary['mean']:.1f} ± {stiffness_summary['std']:.1f} / "
+                f"{stiffness_summary['rmse']:.1f} / {stiffness_summary['min']:.1f} / "
+                f"{stiffness_summary['max']:.1f} N/m"
             )
             print(
-                "  Measured nominal stiffness xyz mean/min/max: "
-                f"x={stiffness_xyz['x']['mean']:.1f}/{stiffness_xyz['x']['min']:.1f}/{stiffness_xyz['x']['max']:.1f}, "
-                f"y={stiffness_xyz['y']['mean']:.1f}/{stiffness_xyz['y']['min']:.1f}/{stiffness_xyz['y']['max']:.1f}, "
-                f"z={stiffness_xyz['z']['mean']:.1f}/{stiffness_xyz['z']['min']:.1f}/{stiffness_xyz['z']['max']:.1f} N/m"
+                "  Measured nominal stiffness xyz mean±std/min/max: "
+                f"x={stiffness_xyz['x']['mean']:.1f} ± {stiffness_xyz['x']['std']:.1f}/"
+                f"{stiffness_xyz['x']['min']:.1f}/{stiffness_xyz['x']['max']:.1f}, "
+                f"y={stiffness_xyz['y']['mean']:.1f} ± {stiffness_xyz['y']['std']:.1f}/"
+                f"{stiffness_xyz['y']['min']:.1f}/{stiffness_xyz['y']['max']:.1f}, "
+                f"z={stiffness_xyz['z']['mean']:.1f} ± {stiffness_xyz['z']['std']:.1f}/"
+                f"{stiffness_xyz['z']['min']:.1f}/{stiffness_xyz['z']['max']:.1f} N/m"
             )
+            if (
+                stiffness_error_summary is not None
+                and all(stiffness_error_xyz[axis] is not None for axis in ("x", "y", "z"))
+            ):
+                print(
+                    "  Measured nominal stiffness error MAE±std xyz/overall: "
+                    f"x={stiffness_error_xyz['x']['mean']:.1f} ± {stiffness_error_xyz['x']['std']:.1f}, "
+                    f"y={stiffness_error_xyz['y']['mean']:.1f} ± {stiffness_error_xyz['y']['std']:.1f}, "
+                    f"z={stiffness_error_xyz['z']['mean']:.1f} ± {stiffness_error_xyz['z']['std']:.1f}, "
+                    f"overall={stiffness_error_summary['mean']:.1f} ± {stiffness_error_summary['std']:.1f} N/m"
+                )
         if force_estimator_summary is not None:
             pred_norm = force_estimator_summary["pred_norm_n"]
             actual_norm = force_estimator_summary["actual_norm_n"]
             err_norm = force_estimator_summary["error_norm_n"]
             err_xyz = force_estimator_summary["error_force_b_n"]
             print(
-                "  Force estimator pred/actual norm mean: "
-                f"{pred_norm['mean']:.1f} / {actual_norm['mean']:.1f} N"
+                "  Force estimator pred/actual norm mean±std: "
+                f"{pred_norm['mean']:.1f} ± {pred_norm['std']:.1f} / "
+                f"{actual_norm['mean']:.1f} ± {actual_norm['std']:.1f} N"
             )
             print(
-                "  Force estimator error norm mean/rmse/max: "
-                f"{err_norm['mean']:.1f} / {err_norm['rmse']:.1f} / {err_norm['max']:.1f} N"
+                "  Force estimator error norm mean±std/rmse/max: "
+                f"{err_norm['mean']:.1f} ± {err_norm['std']:.1f} / "
+                f"{err_norm['rmse']:.1f} / {err_norm['max']:.1f} N"
             )
             print(
-                "  Force estimator error xyz mean: "
-                f"x={err_xyz['x']['mean']:.1f}, "
-                f"y={err_xyz['y']['mean']:.1f}, "
-                f"z={err_xyz['z']['mean']:.1f} N"
+                "  Force estimator error xyz mean±std: "
+                f"x={err_xyz['x']['mean']:.1f} ± {err_xyz['x']['std']:.1f}, "
+                f"y={err_xyz['y']['mean']:.1f} ± {err_xyz['y']['std']:.1f}, "
+                f"z={err_xyz['z']['mean']:.1f} ± {err_xyz['z']['std']:.1f} N"
             )
         print(f"  Config stiffness: {compliance_eval_info['actual_stiffness']}")
         print(f"  Report: {args.ee_output}")
@@ -2148,6 +2270,19 @@ def main():
                         help="Evaluate EE compliance with deterministic EE force sweeps")
     parser.add_argument("--ee_compliance_num_envs", type=int, default=1,
                         help="Number of environments to use for ee_compliance_eval")
+    parser.add_argument(
+        "--ee_compliance_stiffness",
+        "--ee-compliance-stiffness",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional EE nominal stiffness for compliance eval. Use one isotropic "
+            "value, or three xyz values. For range-trained high-level policies "
+            "this is both the policy input and compliance reference; omitting it "
+            "keeps the existing cfg/sampler behavior."
+        ),
+    )
     parser.add_argument("--root_compliance_eval", "--root-compliance-eval", action="store_true", default=False,
                         help="Evaluate root/locomotion compliance with deterministic world-frame force sweeps")
     parser.add_argument("--root_compliance_num_envs", type=int, default=1,

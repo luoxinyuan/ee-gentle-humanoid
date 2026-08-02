@@ -1675,6 +1675,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_margin_right_range: Sequence[Sequence[float]] | None = None,
         net_pull_ee_compliance_stiffness: float = 200.0,
         net_pull_ee_compliance_stiffness_range: Sequence[float] | None = None,
+        net_pull_ee_compliance_stiffness_xyz_range: Sequence[Sequence[float]] | None = None,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
         use_net_pull_ee_target_for_tracking: bool = False,
@@ -1922,6 +1923,33 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                     "net_pull_ee_compliance_stiffness_range must satisfy 0 < min <= max."
                 )
             self.net_pull_ee_compliance_stiffness_range = (stiffness_min, stiffness_max)
+        self.net_pull_ee_compliance_stiffness_xyz_range = None
+        if net_pull_ee_compliance_stiffness_xyz_range is not None:
+            if self.net_pull_ee_compliance_stiffness_range is not None:
+                raise ValueError(
+                    "Use either net_pull_ee_compliance_stiffness_range or "
+                    "net_pull_ee_compliance_stiffness_xyz_range, not both."
+                )
+            xyz_range = torch.as_tensor(
+                net_pull_ee_compliance_stiffness_xyz_range,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if xyz_range.shape != (2, 3):
+                raise ValueError(
+                    "net_pull_ee_compliance_stiffness_xyz_range must be "
+                    "[[min_x, min_y, min_z], [max_x, max_y, max_z]]."
+                )
+            if torch.any(xyz_range <= 0.0) or torch.any(xyz_range[1] < xyz_range[0]):
+                raise ValueError(
+                    "net_pull_ee_compliance_stiffness_xyz_range must contain "
+                    "positive per-axis bounds with min <= max."
+                )
+            self.net_pull_ee_compliance_stiffness_xyz_range = (
+                xyz_range[0],
+                xyz_range[1],
+            )
+            self.net_pull_ee_compliance_directional = True
         self.net_pull_ee_compliance_stiffness_current = torch.empty(
             self.num_envs, 1, 3, dtype=torch.float32, device=self.device
         )
@@ -2033,6 +2061,14 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             self.net_pull_ee_compliance_stiffness_current[env_ids] = fixed
 
     def _sample_net_pull_ee_compliance_stiffness(self, env_ids):
+        if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+            stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_xyz_range
+            sampled = torch.empty(env_ids.numel(), 1, 3, device=self.device).uniform_(0.0, 1.0)
+            sampled = stiffness_min.reshape(1, 1, 3) + sampled * (
+                stiffness_max - stiffness_min
+            ).reshape(1, 1, 3)
+            self.net_pull_ee_compliance_stiffness_current[env_ids] = sampled
+            return
         if self.net_pull_ee_compliance_stiffness_range is None:
             self._set_net_pull_ee_compliance_stiffness_fixed(env_ids)
             return
@@ -2059,6 +2095,26 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
             name="net_pull_ee_compliance_stiffness",
             device=self.device,
         )
+        if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+            values = parsed.reshape(-1)
+            if values.numel() == 1:
+                values = values.expand(3)
+            if values.numel() != 3:
+                raise ValueError(
+                    "XYZ-range EE compliance policies require one scalar or three "
+                    "stiffness values."
+                )
+            stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_xyz_range
+            if torch.any(values < stiffness_min) or torch.any(values > stiffness_max):
+                raise ValueError(
+                    "Requested EE stiffness is outside the configured per-axis range "
+                    f"[{stiffness_min.tolist()}, {stiffness_max.tolist()}], got {values.tolist()}."
+                )
+            self.net_pull_ee_compliance_stiffness = values
+            self.net_pull_ee_compliance_stiffness_current[:] = values.reshape(1, 1, 3)
+            self.net_pull_ee_compliance_directional = True
+            return
+
         if self.net_pull_ee_compliance_stiffness_range is not None:
             if directional:
                 values = parsed.reshape(-1)
@@ -2129,11 +2185,14 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                 v0_b=nominal_vel_b[self.last_reset_env_ids],
             )
 
-        if self.net_pull_ee_compliance_stiffness_range is None:
+        if (
+            self.net_pull_ee_compliance_stiffness_range is None
+            and self.net_pull_ee_compliance_stiffness_xyz_range is None
+        ):
             stiffness = self.net_pull_ee_compliance_stiffness
         else:
-            # [1, env, 1, xyz] broadcasts over both hands while keeping
-            # one isotropic K per environment.
+            # [1, env, 1, xyz] broadcasts over both hands. The active K may
+            # be isotropic or independently sampled per xyz axis.
             stiffness = self.net_pull_ee_compliance_stiffness_current.unsqueeze(0)
         mass = torch.as_tensor(self.net_pull_ee_admit.mass, device=self.device, dtype=torch.float32)
         damping = 2.0 * torch.sqrt(stiffness * mass)
@@ -2466,11 +2525,14 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         ])
         low = ranges[ee_ids, 0]
         high = ranges[ee_ids, 1]
-        stiffness = self.net_pull_ee_compliance_stiffness
-        if stiffness.ndim == 0:
-            stiffness_xyz = torch.full_like(force_dir_b, float(stiffness.item()))
+        if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+            stiffness_xyz = self.net_pull_ee_compliance_stiffness_current[active_env_ids, 0, :]
         else:
-            stiffness_xyz = stiffness.reshape(1, 3).expand_as(force_dir_b)
+            stiffness = self.net_pull_ee_compliance_stiffness
+            if stiffness.ndim == 0:
+                stiffness_xyz = torch.full_like(force_dir_b, float(stiffness.item()))
+            else:
+                stiffness_xyz = stiffness.reshape(1, 3).expand_as(force_dir_b)
 
         eps = 1e-6
         positive = force_dir_b > eps
@@ -3269,7 +3331,11 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     @observation
     def net_pull_ee_compliance_stiffness_command(self):
-        """Normalized isotropic EE stiffness command in the range task."""
+        """Normalized EE stiffness command for scalar or xyz range tasks."""
+        if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+            stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_xyz_range
+            stiffness = self.net_pull_ee_compliance_stiffness_current[:, 0, :]
+            return 2.0 * (stiffness - stiffness_min) / (stiffness_max - stiffness_min) - 1.0
         if self.net_pull_ee_compliance_stiffness_range is None:
             return torch.zeros(self.num_envs, 1, device=self.device)
         stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_range
@@ -3277,6 +3343,8 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         return 2.0 * (stiffness - stiffness_min) / (stiffness_max - stiffness_min) - 1.0
 
     def net_pull_ee_compliance_stiffness_command_sym(self):
+        if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+            return sym_utils.SymmetryTransform(perm=torch.arange(3), signs=[1, 1, 1])
         return sym_utils.SymmetryTransform(perm=torch.arange(1), signs=[1])
 
     @observation
