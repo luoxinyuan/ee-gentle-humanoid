@@ -1,0 +1,24 @@
+# Copy this file, fill the seven adapt/finetune checkpoints, and pass it to
+# scripts/eval_manipulation.py with --moe_experts_config.
+#
+# A checkpoint may be local:
+#   checkpoint_path: /absolute/path/to/checkpoint_final.pt
+# or downloaded from W&B:
+#   checkpoint_path: run:entity/project/run_id
+#   checkpoint_path: run:entity/project/run_id:iteration
+
+experts:
+  baseline_600:
+    checkpoint_path: null
+  x_400:
+    checkpoint_path: null
+  x_200:
+    checkpoint_path: null
+  y_400:
+    checkpoint_path: null
+  y_200:
+    checkpoint_path: null
+  z_400:
+    checkpoint_path: null
+  z_200:
+    checkpoint_path: null

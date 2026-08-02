@@ -108,6 +108,10 @@ def make_env_policy(cfg: DictConfig):
     base_env = SimpleEnv(cfg.task)
     aa.print("SimpleEnv done")
 
+    preload_low_policy = getattr(base_env.action_manager, "preload_low_policy", None)
+    if callable(preload_low_policy):
+        preload_low_policy()
+
     if cfg.checkpoint_path is not None and aa.is_main_process():
         checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
         aa.print(f"Loading checkpoint from {checkpoint_path}")

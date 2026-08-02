@@ -1,5 +1,6 @@
 import warnings
 import copy
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import List, Union
@@ -30,6 +31,13 @@ from ..utils.valuenorm import ValueNorm1, ValueNormFake
 from .common import *
 import active_adaptation as aa
 import functools
+
+
+def _compile_training_function(function):
+    """Compile PPO-only helpers unless evaluation explicitly disables it."""
+    if os.environ.get("ACTIVE_ADAPTATION_DISABLE_TORCH_COMPILE") == "1":
+        return function
+    return torch.compile(function)
 
 __all__ = ["PPOPolicy", "PPOConfig"]
 
@@ -510,7 +518,7 @@ class PPOPolicy(TensorDictModuleBase):
         return {"adapt/estimator_loss": loss_pred.detach(), "adapt/joint_loss": loss_joint.detach()}
 
     @staticmethod
-    @torch.compile
+    @_compile_training_function
     @torch.no_grad()
     def _compute_advantage(td, critic, gae, value_norm, REWARD_KEY="reward", TERM_KEY="term", DONE_KEY="done"):
         keys = td.keys(True, True)
@@ -536,7 +544,7 @@ class PPOPolicy(TensorDictModuleBase):
         td["adv"], td["ret"] = adv, value_norm.normalize(ret)
 
     @staticmethod
-    @torch.compile
+    @_compile_training_function
     def get_global_mean_std(x: torch.Tensor, mask: torch.Tensor):
         if aa.is_distributed():
             local_count = mask.sum()

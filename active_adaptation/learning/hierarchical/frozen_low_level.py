@@ -32,6 +32,7 @@ class FrozenLowLevelPolicy:
         vecnorm: str | None = "eval",
         in_keys: Sequence[str] | None = None,
         drop_policy_slices: Sequence[Sequence[int]] | None = None,
+        preload: bool = False,
         device: str | torch.device | None = None,
     ):
         self.env = env
@@ -43,6 +44,7 @@ class FrozenLowLevelPolicy:
         self.vecnorm_mode = vecnorm
         self.in_keys = list(in_keys) if in_keys is not None else None
         self.drop_policy_slices = [tuple(s) for s in drop_policy_slices or []]
+        self.preload = bool(preload)
         self.device = torch.device(device or env.device)
 
         self.policy = None
@@ -166,7 +168,12 @@ class FrozenLowLevelPolicy:
         if self._loaded:
             return
 
+        aa.print(
+            "[LowPolicy] Loading frozen low-level checkpoint "
+            f"(run_path={self.run_path!r}, checkpoint_path={self.checkpoint_path!r})"
+        )
         checkpoint_path = self._resolve_checkpoint_path()
+        aa.print(f"[LowPolicy] Resolved checkpoint: {checkpoint_path}")
         state_dict = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         ckpt_cfg = state_dict.get("cfg")
         if ckpt_cfg is None:
@@ -196,6 +203,7 @@ class FrozenLowLevelPolicy:
         self.rollout_policy = self.policy.get_rollout_policy("eval")
         self.obs_norm = self._build_obs_norm(state_dict, observation_spec)
         self._loaded = True
+        aa.print("[LowPolicy] Frozen low-level policy ready")
 
     @torch.no_grad()
     def act(self, tensordict: TensorDictBase) -> torch.Tensor:

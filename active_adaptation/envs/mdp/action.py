@@ -303,6 +303,11 @@ class HierarchicalRootCommand(ActionManager):
         self._reset_ee_command(torch.arange(self.num_envs, device=self.device))
         self._reset_feet_command(torch.arange(self.num_envs, device=self.device))
 
+    def preload_low_policy(self):
+        """Load the frozen low-level policy after the env specs are ready."""
+        if self.low_policy.preload:
+            self.low_policy.load()
+
     @property
     def joint_ids(self):
         return self.low_action_manager.joint_ids

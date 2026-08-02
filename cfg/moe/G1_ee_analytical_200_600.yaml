@@ -1,0 +1,18 @@
+# Frozen deployable high-level experts for the analytical xyz EE MoE.
+# All entries use the completed force-b adapt runs.
+
+experts:
+  baseline_600:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_600xyz_3kp_force_b_stu_adapt_20260801_205513
+  x_400:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_400x_3kp_force_b_stu_adapt_20260801_205513
+  x_200:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_200x_3kp_force_b_stu_adapt_20260730_014830
+  y_400:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_400y_3kp_force_b_stu_adapt_20260801_205513
+  y_200:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_200y_3kp_force_b_stu_adapt_20260730_014830
+  z_400:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_400z_3kp_force_b_stu_adapt_20260801_205513
+  z_200:
+    checkpoint_path: run:luoxinyuan-duke-university/gentle_humanoid_high_level/ee_200z_3kp_force_b_stu_adapt_20260730_014830

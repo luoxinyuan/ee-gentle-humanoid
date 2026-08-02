@@ -181,6 +181,35 @@ root_student_force_ppo_finetune
 
 These estimate `hl_force_priv` from deployable student observations and feed the predicted force information directly into the student actor.
 
+### Analytical EE MoE
+
+The training-free EE MoE combines seven frozen adapt/finetune policies: the
+600xyz baseline and the 200/400 experts for each xyz axis. It interpolates in
+inverse stiffness and composes the left/right EE action axis by axis; there is
+no learned gate.
+
+Copy `cfg/moe/G1_ee_analytical_200_600.example.yaml`, fill all seven checkpoint
+paths, then evaluate any requested xyz stiffness:
+
+```bash
+python scripts/eval_manipulation.py \
+  --moe_experts_config cfg/moe/G1_ee_analytical_200_600.yaml \
+  --ee_compliance_eval \
+  --ee_compliance_stiffness 300 500 600
+```
+
+Run the full `{200,300,400,500,600}^3` grid with:
+
+```bash
+python scripts/eval_moe_xyz_grid.py \
+  --moe_experts_config cfg/moe/G1_ee_analytical_200_600.yaml \
+  --num_envs 8
+```
+
+Each expert keeps its checkpoint-specific VecNorm. The MoE task exposes the
+stiffness command through a separate `hl_moe` observation so the fixed experts'
+original `hl_policy` input shape remains unchanged.
+
 Common high-level student tasks:
 
 ```text

@@ -24,6 +24,21 @@ import json
 import datetime
 import re
 
+# ``active_adaptation.learning`` is imported below by the evaluation helpers.
+# It contains a couple of training-time ``@torch.compile`` decorators, which
+# are materialized during import.  The compiler stance therefore has to be set
+# before importing those helpers; setting it later in ``main()`` is too late.
+_MOE_EAGER_CONFIGURED = False
+if "--moe_experts_config" in sys.argv or "--moe-experts-config" in sys.argv:
+    # PPO's compiled helpers are training-only.  Set this before importing
+    # active_adaptation.learning so their decorators become no-ops for MoE
+    # deployment instead of creating an Inductor worker pool at import time.
+    os.environ["ACTIVE_ADAPTATION_DISABLE_TORCH_COMPILE"] = "1"
+    _set_compiler_stance = getattr(getattr(torch, "compiler", None), "set_stance", None)
+    if _set_compiler_stance is not None:
+        _set_compiler_stance("force_eager")
+        _MOE_EAGER_CONFIGURED = True
+
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -74,6 +89,10 @@ def _default_ee_report_path(args, prefix: str) -> str:
         policy_name = _safe_report_name(args.run_path)
     elif args.checkpoint:
         policy_name = _safe_report_name(os.path.splitext(os.path.basename(args.checkpoint))[0])
+    elif getattr(args, "moe_experts_config", None):
+        policy_name = _safe_report_name(
+            os.path.splitext(os.path.basename(args.moe_experts_config))[0]
+        )
     else:
         policy_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     stiffness_values = getattr(args, "ee_compliance_stiffness", None)
@@ -82,6 +101,45 @@ def _default_ee_report_path(args, prefix: str) -> str:
         stiffness_token = "_".join(f"{value:g}" for value in stiffness_values)
         stiffness_suffix = f"_k{_safe_report_name(stiffness_token)}"
     return os.path.join("outputs", f"{prefix}_{policy_name}{stiffness_suffix}.json")
+
+
+def _policy_source_label(args) -> str:
+    return args.run_path or args.checkpoint or getattr(args, "moe_experts_config", None) or "unknown"
+
+
+def _configure_evaluation_compiler(args) -> None:
+    """Keep deploy/evaluation inference out of TorchInductor.
+
+    The analytical MoE executes seven frozen high-level policies and the
+    hierarchical action manager executes the low-level policy in the same
+    rollout.  A compiled function in either checkpoint can otherwise trigger
+    a very large first-call Inductor compilation, leaving the EE sweep with
+    no visible progress.  Evaluation does not benefit from training-time
+    compilation, so force eager execution for the MoE deployment path.
+
+    ``set_stance`` was added after the first PyTorch 2.x releases; retain a
+    no-op fallback so this script remains usable with older environments.
+    """
+    if not getattr(args, "moe_experts_config", None):
+        return
+
+    set_stance = getattr(getattr(torch, "compiler", None), "set_stance", None)
+    if set_stance is None:
+        print(
+            "[Info] Analytical MoE eval: torch.compiler.set_stance is unavailable; "
+            "using the environment's default compiler behavior.",
+            flush=True,
+        )
+        return
+
+    if not _MOE_EAGER_CONFIGURED:
+        set_stance("force_eager")
+    print(
+        "[Info] Analytical MoE eval: TorchInductor disabled; using eager inference.",
+        flush=True,
+    )
+
+
 EE_COMPLIANCE_FORCE_DIRECTIONS = [
     ("+x", [1.0, 0.0, 0.0]),
     ("-x", [-1.0, 0.0, 0.0]),
@@ -629,6 +687,16 @@ def _get_hl_ee_command_pos_b(action_manager, env_ids: torch.Tensor | None = None
     return _slice_envs(command_pos_b, env_ids)
 
 
+def _refresh_moe_stiffness_observation(td_, command_manager):
+    """Refresh the analytical-MoE gate input after an eval stiffness update."""
+    if "hl_moe" not in td_.keys():
+        return td_
+    observation_fn = getattr(command_manager, "net_pull_ee_compliance_stiffness_command", None)
+    if observation_fn is not None:
+        td_["hl_moe"] = observation_fn()
+    return td_
+
+
 def _set_external_force(command_manager, enabled: bool):
     if hasattr(command_manager, "set_external_force_enabled"):
         command_manager.set_external_force_enabled(enabled)
@@ -933,6 +1001,7 @@ def evaluate_ee_tracking(cfg, args):
         report = {
             "checkpoint": args.checkpoint,
             "run_path": args.run_path,
+            "moe_experts_config": getattr(args, "moe_experts_config", None),
             "task": args.task,
             "seed": EE_TRACKING_SEED,
             "num_envs": args.num_envs,
@@ -1378,6 +1447,7 @@ def evaluate_root_compliance(cfg, args):
         report = {
             "checkpoint": args.checkpoint,
             "run_path": args.run_path,
+            "moe_experts_config": getattr(args, "moe_experts_config", None),
             "task": args.task,
             "num_envs": args.root_compliance_num_envs if args.root_compliance_eval else args.num_envs,
             "root_reference": "static_zero_velocity",
@@ -1515,6 +1585,7 @@ def evaluate_ee_compliance(cfg, args):
             compliance_params,
             command_manager,
         )
+        _refresh_moe_stiffness_observation(td_, command_manager)
         force_estimator_ablation = bool(getattr(args, "ee_compliance_force_estimator_ablation", False))
         if force_estimator_ablation and not _is_hierarchical_action_manager(action_manager):
             raise RuntimeError(
@@ -1664,6 +1735,7 @@ def evaluate_ee_compliance(cfg, args):
                     getattr(args, "ee_compliance_stiffness", None),
                     command_manager,
                 )
+                _refresh_moe_stiffness_observation(td_, command_manager)
                 _set_static_root_command(command_manager, asset)
                 if _set_default_feet_command(command_manager, asset):
                     pass
@@ -1745,6 +1817,7 @@ def evaluate_ee_compliance(cfg, args):
                 force_samples = [[] for _ in range(active_envs)]
                 force_pred_samples = [[] for _ in range(active_envs)]
                 hl_command_samples = [[] for _ in range(active_envs)]
+                moe_gate_samples = [[] for _ in range(active_envs)]
                 full_forces = [
                     case["direction_b"] * case["force_n"]
                     for case in batch_cases
@@ -1786,6 +1859,10 @@ def evaluate_ee_compliance(cfg, args):
                                 force_pred_samples[env_i].append(
                                     direct_force_pred_b[env_ids[env_i]:env_ids[env_i] + 1]
                                 )
+                            if "moe_gate_weights" in policy_td.keys():
+                                moe_gate_samples[env_i].append(
+                                    policy_td["moe_gate_weights"][env_ids[env_i]:env_ids[env_i] + 1]
+                                )
                             if sample_hl_command_pos_b is not None:
                                 hl_command_samples[env_i].append(sample_hl_command_pos_b[env_i:env_i + 1])
 
@@ -1806,6 +1883,11 @@ def evaluate_ee_compliance(cfg, args):
                     hl_command_pos_b = (
                         _mean_tensor_samples(hl_command_samples[env_i])
                         if hl_command_samples[env_i]
+                        else None
+                    )
+                    moe_gate_weights = (
+                        _mean_tensor_samples(moe_gate_samples[env_i])
+                        if moe_gate_samples[env_i]
                         else None
                     )
                     nominal_error = (actual_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i]+1]).norm(dim=-1)
@@ -1893,6 +1975,11 @@ def evaluate_ee_compliance(cfg, args):
                         "hl_command_pos_b": (
                             hl_command_pos_b.detach().cpu().tolist()
                             if hl_command_pos_b is not None
+                            else None
+                        ),
+                        "moe_gate_weights_600_400_200": (
+                            moe_gate_weights.detach().cpu().tolist()
+                            if moe_gate_weights is not None
                             else None
                         ),
                         "compliance_target_pos_b": compliance_target_b.detach().cpu().tolist(),
@@ -2061,6 +2148,7 @@ def evaluate_ee_compliance(cfg, args):
         report = {
             "checkpoint": args.checkpoint,
             "run_path": args.run_path,
+            "moe_experts_config": getattr(args, "moe_experts_config", None),
             "task": args.task,
             "num_envs": args.ee_compliance_num_envs if args.ee_compliance_eval else args.num_envs,
             "ee_body_names": body_names,
@@ -2253,6 +2341,16 @@ def main():
     parser = argparse.ArgumentParser(description="Manipulation evaluation with teleoperation")
     parser.add_argument("-r", "--run_path", type=str, help="WandB run path")
     parser.add_argument("--checkpoint", type=str, help="Local checkpoint path (alternative to wandb)")
+    parser.add_argument(
+        "--moe_experts_config",
+        "--moe-experts-config",
+        type=str,
+        default=None,
+        help=(
+            "YAML manifest for the seven frozen experts of the analytical EE MoE. "
+            "This is an alternative to --run_path/--checkpoint."
+        ),
+    )
     parser.add_argument("--task", type=str, default=None, help="Override task config")
     parser.add_argument("-p", "--play", action="store_true", default=False, help="Play mode (visualize)")
     parser.add_argument("-i", "--iterations", type=int, default=None, help="Checkpoint iteration to load")
@@ -2310,6 +2408,18 @@ def main():
     if args.ee_compliance_force_estimator_ablation and not args.ee_compliance_eval:
         print("Error: --ee_compliance_force_estimator_ablation can only be used with --ee_compliance_eval.")
         sys.exit(1)
+    policy_sources = [args.run_path, args.checkpoint, args.moe_experts_config]
+    if sum(source is not None for source in policy_sources) != 1:
+        print(
+            "Error: specify exactly one of --run_path, --checkpoint, or "
+            "--moe_experts_config."
+        )
+        sys.exit(1)
+    if args.moe_experts_config and args.export:
+        print("Error: analytical MoE export is not supported; evaluate or play it directly.")
+        sys.exit(1)
+
+    _configure_evaluation_compiler(args)
 
     # Determine checkpoint source
     if args.run_path:
@@ -2371,8 +2481,39 @@ def main():
         OmegaConf.set_struct(cfg, False)
         cfg["checkpoint_path"] = args.checkpoint
         cfg["vecnorm"] = "eval"
+
+    elif args.moe_experts_config:
+        if not os.path.isfile(args.moe_experts_config):
+            print(f"Error: MoE experts config does not exist: {args.moe_experts_config}")
+            sys.exit(1)
+        with hydra.initialize(config_path="../cfg", job_name="eval_manipulation", version_base=None):
+            cfg = hydra.compose(
+                config_name="eval",
+                overrides=[
+                    "task=G1/G1_hl_ee_xyz_analytical_moe_200_600_force_b_student",
+                    "+algo=root_student_force_analytical_moe",
+                ],
+            )
+        OmegaConf.set_struct(cfg, False)
+        manifest = OmegaConf.load(args.moe_experts_config)
+        algo_override = manifest.get("algo", manifest)
+        cfg["algo"] = OmegaConf.merge(cfg.algo, algo_override)
+        cfg["checkpoint_path"] = None
+        cfg["vecnorm"] = None
+
+        missing_experts = []
+        for expert_name, expert_cfg in cfg.algo.experts.items():
+            if not expert_cfg.get("checkpoint_path", None) and not expert_cfg.get("run_path", None):
+                missing_experts.append(expert_name)
+        if missing_experts:
+            print(
+                "Error: MoE experts config has no checkpoint_path/run_path for: "
+                + ", ".join(missing_experts)
+            )
+            sys.exit(1)
+        print(f"Loading analytical EE MoE experts from: {args.moe_experts_config}")
     else:
-        print("Error: Must specify either --run_path or --checkpoint")
+        print("Error: no policy source was selected.")
         sys.exit(1)
 
     # Note: UdpTeleopReceiver is already started by default in MotionTrackingCommand
@@ -2449,7 +2590,7 @@ def main():
         print("\n" + "="*60)
         print("MANIPULATION TASK (EE Tracking Eval)")
         print("="*60)
-        print(f"  Run: {args.run_path or args.checkpoint}")
+        print(f"  Run: {_policy_source_label(args)}")
         print(f"  Num envs: {args.num_envs}")
         print(f"  Seed: {EE_TRACKING_SEED}")
         print(f"  EE points: {EE_TRACKING_NUM_POINTS}")
@@ -2467,7 +2608,7 @@ def main():
         print("\n" + "="*60)
         print("MANIPULATION TASK (EE Compliance Eval)")
         print("="*60)
-        print(f"  Run: {args.run_path or args.checkpoint}")
+        print(f"  Run: {_policy_source_label(args)}")
         print(f"  Num envs: {args.ee_compliance_num_envs}")
         print(f"  EE bodies: {EE_TRACKING_BODY_NAMES}")
         print(f"  Force directions: {[name for name, _ in EE_COMPLIANCE_FORCE_DIRECTIONS]}")
@@ -2485,7 +2626,7 @@ def main():
         print("\n" + "="*60)
         print("MANIPULATION TASK (Root Compliance Eval)")
         print("="*60)
-        print(f"  Run: {args.run_path or args.checkpoint}")
+        print(f"  Run: {_policy_source_label(args)}")
         print(f"  Num envs: {args.root_compliance_num_envs}")
         print(f"  Root force bodies: {ROOT_COMPLIANCE_BODY_NAMES}")
         print(f"  Force directions: {[name for name, _ in ROOT_COMPLIANCE_FORCE_DIRECTIONS]}")
@@ -2544,7 +2685,7 @@ def main():
         print("\n" + "="*60)
         print("MANIPULATION TASK (Teleoperation Mode)")
         print("="*60)
-        print(f"  Run: {args.run_path or args.checkpoint}")
+        print(f"  Run: {_policy_source_label(args)}")
         print(f"  Num envs: {args.num_envs}")
         print(f"  Max episode length: 1000000 steps (~5.5 hours at 50Hz)")
         print(f"  External force: {args.external_force}")
