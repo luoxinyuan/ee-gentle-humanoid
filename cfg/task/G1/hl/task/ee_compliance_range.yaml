@@ -9,3 +9,7 @@ observation:
   hl_policy:
     # Normalized to [-1, 1] over the configured stiffness range.
     net_pull_ee_compliance_stiffness_command: {}
+  hl_force_priv:
+    # Use the clean deploy-relevant per-hand root-frame force target.
+    net_pull_force_priv: {enabled: false}
+    net_pull_ee_force_b_priv: {}
