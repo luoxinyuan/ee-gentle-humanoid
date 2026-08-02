@@ -1,0 +1,11 @@
+# Optional high-level EE compliance range configuration.
+# Include this fragment only in tasks that should train across stiffnesses.
+
+command:
+  # One isotropic stiffness is sampled independently per environment.
+  net_pull_ee_compliance_stiffness_range: [200.0, 600.0]
+
+observation:
+  hl_policy:
+    # Normalized to [-1, 1] over the configured stiffness range.
+    net_pull_ee_compliance_stiffness_command: {}

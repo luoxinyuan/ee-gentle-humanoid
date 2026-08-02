@@ -1,0 +1,6 @@
+name: G1HLEERANGE200600STUDENT
+
+defaults:
+  - /task/G1/G1_hl_ee_compliance_pos_delta_student@_here_
+  - /task/G1/hl/task/ee_compliance_range@_here_
+  - _self_

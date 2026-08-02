@@ -1,0 +1,9 @@
+name: G1HLEERANGE200300STUDENT
+
+defaults:
+  - /task/G1/G1_hl_ee_compliance_pos_delta_student@_here_
+  - /task/G1/hl/task/ee_compliance_range@_here_
+  - _self_
+
+command:
+  net_pull_ee_compliance_stiffness_range: [200.0, 300.0]
