@@ -59,13 +59,17 @@ run_pipeline() {
 }
 
 run_pipeline \
-  "G1/G1_hl_ee_range_200_600_student" \
-  "ee_range_200_600_3kp_stu"
+  "G1/G1_hl_ee_x400_compliance_pos_delta_force_b_student" \
+  "ee_400x_3kp_force_b_stu"
 
 run_pipeline \
-  "G1/G1_hl_ee_range_200_400_student" \
-  "ee_range_200_400_3kp_stu"
+  "G1/G1_hl_ee_y400_compliance_pos_delta_force_b_student" \
+  "ee_400y_3kp_force_b_stu"
 
 run_pipeline \
-  "G1/G1_hl_ee_range_200_300_student" \
-  "ee_range_200_300_3kp_stu"
+  "G1/G1_hl_ee_z400_compliance_pos_delta_force_b_student" \
+  "ee_400z_3kp_force_b_stu"
+
+run_pipeline \
+  "G1/G1_hl_ee_xyz600_compliance_pos_delta_force_b_student" \
+  "ee_600xyz_3kp_force_b_stu"
