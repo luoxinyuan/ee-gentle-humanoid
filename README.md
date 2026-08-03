@@ -210,6 +210,44 @@ Each expert keeps its checkpoint-specific VecNorm. The MoE task exposes the
 stiffness command through a separate `hl_moe` observation so the fixed experts'
 original `hl_policy` input shape remains unchanged.
 
+### Learned EE MoE Gate
+
+The v2 learned-gate MoE freezes the same seven deployable experts and trains
+only a command-conditioned analytical-prior residual gate and a training-only
+critic. Its action noise is fixed. The gate starts exactly from analytical
+interpolation and receives only normalized `[kx, ky, kz]`, avoiding the
+train/eval distribution shift previously introduced by expert-action features.
+
+The shared v2 range task mixes continuous xyz stiffness, five discrete levels,
+and important expert anchors. It also adds a force-consistency reward based on
+`K_cmd * (x_actual - x_nominal) - F_external` and static EE target coverage.
+
+Train the conservative v2 gate with:
+
+```bash
+bash train_hl_moe_gate.sh
+```
+
+Evaluate a trained gate at one stiffness command:
+
+```bash
+python scripts/eval_manipulation.py \
+  --run_path ENTITY/PROJECT/LEARNED_MOE_RUN \
+  --full_collision \
+  --ee_compliance_eval \
+  --ee_compliance_num_envs 8 \
+  --ee_compliance_stiffness 300 500 600 \
+  --objects cfg/objects/boxes_scene.yaml
+```
+
+The grid evaluator accepts the learned checkpoint directly:
+
+```bash
+python scripts/eval_moe_xyz_grid.py \
+  --run_path ENTITY/PROJECT/LEARNED_MOE_RUN \
+  --num_envs 8
+```
+
 Common high-level student tasks:
 
 ```text

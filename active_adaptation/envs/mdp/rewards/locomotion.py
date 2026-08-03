@@ -17,6 +17,7 @@ from active_adaptation.utils.math import (
     quat_mul,
     yaw_quat,
 )
+from active_adaptation.utils.ee_compliance import force_stiffness_consistency_reward
 from ..commands import *
 
 if TYPE_CHECKING:
@@ -468,6 +469,79 @@ class ee_force_compliance_tracking(Reward):
         )
         error = (actual_ee_b - compliance_target_b).norm(dim=-1).mean(dim=-1, keepdim=True)
         return torch.exp(-error / self.sigma)
+
+
+class ee_force_stiffness_consistency(Reward):
+    """Reward per-axis agreement between commanded stiffness and EE deflection.
+
+    The residual ``K_cmd * (x_actual - x_nominal) - F_external`` avoids the
+    singular ``F / displacement`` stiffness estimate used for reporting. Only
+    environments with an active hand pull contribute this reward; the existing
+    compliance tracking reward continues to handle no-force nominal tracking.
+    """
+
+    def __init__(
+        self,
+        env,
+        weight: float,
+        force_scale: float = 15.0,
+        sigma: float = 1.0,
+        force_deadband: float = 0.5,
+        enabled: bool = True,
+    ):
+        super().__init__(env, weight, enabled)
+        if force_scale <= 0.0:
+            raise ValueError(f"force_scale must be positive, got {force_scale}.")
+        if sigma <= 0.0:
+            raise ValueError(f"sigma must be positive, got {sigma}.")
+        if force_deadband < 0.0:
+            raise ValueError(
+                f"force_deadband must be non-negative, got {force_deadband}."
+            )
+        self.asset: Articulation = self.env.scene["robot"]
+        self.force_scale = float(force_scale)
+        self.sigma = float(sigma)
+        self.force_deadband = float(force_deadband)
+        self.ee_names = ["left_hand_mimic", "right_hand_mimic"]
+        self.ee_asset_ids = torch.tensor(
+            [self.asset.body_names.index(name) for name in self.ee_names],
+            device=self.device,
+            dtype=torch.long,
+        )
+
+    def compute(self) -> tuple[torch.Tensor, torch.Tensor]:
+        command = self.env.command_manager
+        required = (
+            "get_net_pull_ee_nominal_target_b",
+            "get_net_pull_ee_force_b",
+            "get_net_pull_ee_compliance_stiffness",
+        )
+        if any(not hasattr(command, name) for name in required):
+            inactive = torch.zeros(
+                self.num_envs, 1, dtype=torch.bool, device=self.device
+            )
+            return torch.zeros(self.num_envs, 1, device=self.device), inactive
+
+        nominal_b = command.get_net_pull_ee_nominal_target_b()
+        force_b = command.get_net_pull_ee_force_b()
+        stiffness = command.get_net_pull_ee_compliance_stiffness()
+        root_quat = self.asset.data.root_quat_w.unsqueeze(1)
+        actual_b = quat_apply_inverse(
+            root_quat.expand(-1, len(self.ee_names), -1),
+            self.asset.data.body_pos_w[:, self.ee_asset_ids]
+            - self.asset.data.root_pos_w.unsqueeze(1),
+        )
+
+        stiffness = stiffness.expand(-1, len(self.ee_names), -1)
+        return force_stiffness_consistency_reward(
+            actual_b,
+            nominal_b,
+            force_b,
+            stiffness,
+            force_scale=self.force_scale,
+            sigma=self.sigma,
+            force_deadband=self.force_deadband,
+        )
 
 
 class ee_force_limit_penalty(Reward):

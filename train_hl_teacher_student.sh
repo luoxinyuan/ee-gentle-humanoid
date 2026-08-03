@@ -4,9 +4,9 @@ set -euo pipefail
 LOW_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid"
 HL_PROJECT_PATH="luoxinyuan-duke-university/gentle_humanoid_high_level"
 HL_WANDB_PROJECT="gentle_humanoid_high_level"
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-MASTER_PORT="29508"
-NPROC="8"
+CUDA_VISIBLE_DEVICES="0,1,2,3"
+MASTER_PORT="29501"
+NPROC="4"
 LOW_RUN_PATH="${LOW_PROJECT_PATH}/gentle_3kp_stiff_finetune_limmt_full_force30"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -62,6 +62,6 @@ run_pipeline() {
 
 run_pipeline \
   "G1/G1_hl_ee_xyz_range_200_600_force_b_student" \
-  "ee_xyz_range_200_600_3kp_force_b_stu" \
+  "ee_xyz_range_200_600_v2_3kp_force_b_stu" \
   "8000_000_000" \
   "2000_000_000"

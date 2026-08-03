@@ -156,7 +156,7 @@ class RootStudentPPOPolicy(TensorDictModuleBase):
         self.critic(fake_td)
 
         self.world_size = 1
-        if aa.is_distributed():
+        if aa.is_distributed() and not bool(cfg.get("disable_ddp", False)):
             self.world_size = aa.get_world_size()
             ddp_kwargs = dict(
                 device_ids=[aa.get_local_rank()],

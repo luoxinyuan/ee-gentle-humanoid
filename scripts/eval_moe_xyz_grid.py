@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the analytical EE MoE compliance evaluator over an xyz stiffness grid."""
+"""Run an analytical or learned EE MoE over an xyz stiffness grid."""
 
 from __future__ import annotations
 
@@ -18,7 +18,13 @@ def _stiffness_token(value: float) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--moe_experts_config", "--moe-experts-config", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--moe_experts_config", "--moe-experts-config")
+    source.add_argument(
+        "--run_path",
+        "--run-path",
+        help="W&B run path for a trained learned-gate MoE checkpoint.",
+    )
     parser.add_argument(
         "--levels",
         type=float,
@@ -48,9 +54,11 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     evaluator = repo_root / "scripts" / "eval_manipulation.py"
-    experts_config = Path(args.moe_experts_config).expanduser().resolve()
-    if not experts_config.is_file():
-        parser.error(f"MoE experts config does not exist: {experts_config}")
+    experts_config = None
+    if args.moe_experts_config:
+        experts_config = Path(args.moe_experts_config).expanduser().resolve()
+        if not experts_config.is_file():
+            parser.error(f"MoE experts config does not exist: {experts_config}")
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -65,8 +73,6 @@ def main() -> None:
         command = [
             sys.executable,
             os.fspath(evaluator),
-            "--moe_experts_config",
-            os.fspath(experts_config),
             "--ee_compliance_eval",
             "--ee_compliance_num_envs",
             str(args.num_envs),
@@ -77,6 +83,10 @@ def main() -> None:
             "--ee_output",
             os.fspath(report_path),
         ]
+        if experts_config is not None:
+            command[2:2] = ["--moe_experts_config", os.fspath(experts_config)]
+        else:
+            command[2:2] = ["--run_path", args.run_path]
 
         if args.skip_existing and report_path.is_file():
             status = "skipped"
@@ -104,7 +114,10 @@ def main() -> None:
     with index_path.open("w", encoding="utf-8") as file:
         json.dump(
             {
-                "moe_experts_config": os.fspath(experts_config),
+                "moe_experts_config": (
+                    os.fspath(experts_config) if experts_config is not None else None
+                ),
+                "run_path": args.run_path,
                 "levels": args.levels,
                 "num_cases": len(cases),
                 "records": records,

@@ -1,0 +1,17 @@
+name: G1HLEEXYZLEARNEDMOE200600FORCEBSTUDENT
+
+defaults:
+  - /task/G1/G1_hl_ee_xyz_analytical_moe_200_600_force_b_student@_here_
+  - _self_
+
+# The inherited range task supplies mixed continuous/level/anchor stiffness
+# sampling, static-target coverage, and the per-axis stiffness-consistency
+# reward. Fixed experts still receive their checkpoint-specific hl_policy;
+# only the conservative command-only gate consumes hl_moe.
+
+command:
+  # Exact anchors are already solved by one-hot expert selection and provide
+  # no gate gradient. Keep a small anchor fraction and spend more samples on
+  # continuous/intermediate calibration (60% continuous, 35% levels, 5% anchors).
+  net_pull_ee_compliance_stiffness_levels_prob: 0.35
+  net_pull_ee_compliance_stiffness_anchor_prob: 0.05

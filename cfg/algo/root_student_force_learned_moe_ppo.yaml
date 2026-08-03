@@ -1,0 +1,49 @@
+# @package algo
+defaults:
+  - /moe/G1_ee_analytical_200_600@_here_
+  - _self_
+
+_target_: active_adaptation.learning.hierarchical.root_student_force_learned_moe.RootStudentForceLearnedMoEPolicy
+name: root_student_force_learned_moe_ppo
+
+# Frozen experts consume their checkpoint-specific raw/normalized hl_policy
+# observations. The learned gate sees only bounded stiffness, so no shared
+# VecNorm is applied to its command input.
+vecnorm: null
+in_keys: [hl_policy, hl_moe]
+stiffness_key: hl_moe
+stiffness_anchors: [200.0, 400.0, 600.0]
+composition: full_residual
+action_limit: 0.999
+
+# Conservative v2 gate: command-only conditioning avoids motion/state
+# distribution shift through expert-action features.
+gate_context: stiffness_only
+gate_hidden_dims: [64, 64]
+layer_norm: before
+max_logit_correction: 0.5
+analytical_prior_eps: 1.0e-6
+
+# The action distribution is centered on the full-residual composition.
+init_noise_scale: 0.05
+train_action_std: false
+
+train_every: 32
+ppo_epochs: 5
+num_minibatches: 8
+lr: 1.0e-4
+critic_lr: 3.0e-4
+adaptive_lr: false
+desired_kl: 0.01
+clip_param: 0.2
+entropy_coef_start: 0.0
+entropy_coef_end: 0.0
+
+# Keep the learned gate near the working analytical interpolation throughout.
+prior_coef_start: 0.05
+prior_coef_end: 0.05
+
+# Privileged information is critic-only. It is not consumed by the deployable
+# gate or any frozen student expert.
+critic_in_keys: [hl_policy, hl_moe, hl_priv, hl_force_priv]
+critic_hidden_dims: [512, 256]

@@ -5,12 +5,14 @@ from typing import Any
 
 import hydra
 import torch
+import torch.distributed as dist
 from omegaconf import OmegaConf
 from tensordict import TensorDictBase
 from tensordict.nn import TensorDictModuleBase
 from torchrl.envs.transforms import VecNorm
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
+import active_adaptation as aa
 from active_adaptation.utils.wandb import parse_checkpoint_path
 
 
@@ -188,6 +190,10 @@ class FrozenHighLevelExpert:
             algo_cfg.phase = last_phase
         else:
             algo_cfg.phase = "adapt"
+        # Frozen experts are replicated inference modules inside the outer
+        # MoE. They must not create their own nested DDP wrappers; only the
+        # learned gate/critic (if present) participate in distributed updates.
+        algo_cfg.disable_ddp = True
 
         policy_cls = hydra.utils.get_class(algo_cfg._target_)
         self.policy = policy_cls(
@@ -212,16 +218,28 @@ class FrozenHighLevelExpert:
         checkpoint_path = cfg.get("checkpoint_path", None)
         run_path = cfg.get("run_path", None)
         checkpoint_iteration = cfg.get("checkpoint_iteration", None)
+        spec = None
         if checkpoint_path:
-            return parse_checkpoint_path(str(checkpoint_path))
-        if run_path:
+            spec = str(checkpoint_path)
+        elif run_path:
             spec = f"run:{run_path}"
             if checkpoint_iteration is not None:
                 spec += f":{int(checkpoint_iteration)}"
-            return parse_checkpoint_path(spec)
-        raise ValueError(
-            "Each analytical EE MoE expert needs checkpoint_path or run_path."
-        )
+        if spec is None:
+            raise ValueError(
+                "Each analytical EE MoE expert needs checkpoint_path or run_path."
+            )
+
+        # All ranks share the same filesystem. Download each W&B checkpoint
+        # once on rank zero, then publish its resolved local path to the other
+        # workers before they construct their frozen copy of the expert.
+        if aa.is_distributed():
+            resolved = parse_checkpoint_path(spec) if aa.is_main_process() else None
+            resolved_list = [resolved]
+            dist.broadcast_object_list(resolved_list, src=0)
+            dist.barrier()
+            return resolved_list[0]
+        return parse_checkpoint_path(spec)
 
     @staticmethod
     def _checkpoint_obs_dim(state_dict: Mapping[str, Any], key: str) -> int | None:

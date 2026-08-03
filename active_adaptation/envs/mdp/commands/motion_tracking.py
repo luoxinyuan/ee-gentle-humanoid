@@ -10,6 +10,7 @@ from active_adaptation.envs.mdp import reward, termination, observation
 from active_adaptation.utils.motion import MotionDataset
 from active_adaptation.utils.multimotion import ProgressiveMultiMotionDataset
 from active_adaptation.utils import symmetry as sym_utils
+from active_adaptation.utils.ee_compliance import sample_mixed_xyz_stiffness
 from active_adaptation.utils.math import (
     quat_apply_inverse,
     quat_apply,
@@ -1676,6 +1677,10 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_ee_compliance_stiffness: float = 200.0,
         net_pull_ee_compliance_stiffness_range: Sequence[float] | None = None,
         net_pull_ee_compliance_stiffness_xyz_range: Sequence[Sequence[float]] | None = None,
+        net_pull_ee_compliance_stiffness_levels: Sequence[float] | None = None,
+        net_pull_ee_compliance_stiffness_levels_prob: float = 0.0,
+        net_pull_ee_compliance_stiffness_xyz_anchors: Sequence[Sequence[float]] | None = None,
+        net_pull_ee_compliance_stiffness_anchor_prob: float = 0.0,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
         use_net_pull_ee_target_for_tracking: bool = False,
@@ -1950,6 +1955,96 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
                 xyz_range[1],
             )
             self.net_pull_ee_compliance_directional = True
+        self.net_pull_ee_compliance_stiffness_levels = None
+        self.net_pull_ee_compliance_stiffness_levels_prob = float(
+            net_pull_ee_compliance_stiffness_levels_prob
+        )
+        self.net_pull_ee_compliance_stiffness_xyz_anchors = None
+        self.net_pull_ee_compliance_stiffness_anchor_prob = float(
+            net_pull_ee_compliance_stiffness_anchor_prob
+        )
+        if not 0.0 <= self.net_pull_ee_compliance_stiffness_levels_prob <= 1.0:
+            raise ValueError(
+                "net_pull_ee_compliance_stiffness_levels_prob must be in [0, 1]."
+            )
+        if not 0.0 <= self.net_pull_ee_compliance_stiffness_anchor_prob <= 1.0:
+            raise ValueError(
+                "net_pull_ee_compliance_stiffness_anchor_prob must be in [0, 1]."
+            )
+        if (
+            self.net_pull_ee_compliance_stiffness_levels_prob
+            + self.net_pull_ee_compliance_stiffness_anchor_prob
+            > 1.0
+        ):
+            raise ValueError(
+                "EE stiffness level and anchor probabilities must sum to at most 1."
+            )
+        mixed_sampling_enabled = (
+            self.net_pull_ee_compliance_stiffness_levels_prob > 0.0
+            or self.net_pull_ee_compliance_stiffness_anchor_prob > 0.0
+        )
+        if (
+            mixed_sampling_enabled
+            and self.net_pull_ee_compliance_stiffness_xyz_range is None
+        ):
+            raise ValueError(
+                "Mixed EE stiffness sampling requires "
+                "net_pull_ee_compliance_stiffness_xyz_range."
+            )
+        if net_pull_ee_compliance_stiffness_levels is not None:
+            levels = torch.as_tensor(
+                net_pull_ee_compliance_stiffness_levels,
+                dtype=torch.float32,
+                device=self.device,
+            ).flatten()
+            if levels.numel() == 0 or torch.any(levels <= 0.0):
+                raise ValueError(
+                    "net_pull_ee_compliance_stiffness_levels must contain positive values."
+                )
+            if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+                stiffness_min, stiffness_max = (
+                    self.net_pull_ee_compliance_stiffness_xyz_range
+                )
+                if torch.any(levels[:, None] < stiffness_min) or torch.any(
+                    levels[:, None] > stiffness_max
+                ):
+                    raise ValueError(
+                        "EE stiffness levels must lie inside every configured xyz range."
+                    )
+            self.net_pull_ee_compliance_stiffness_levels = levels
+        if self.net_pull_ee_compliance_stiffness_levels_prob > 0.0 and (
+            self.net_pull_ee_compliance_stiffness_levels is None
+        ):
+            raise ValueError(
+                "Positive EE stiffness levels probability requires stiffness levels."
+            )
+        if net_pull_ee_compliance_stiffness_xyz_anchors is not None:
+            anchors = torch.as_tensor(
+                net_pull_ee_compliance_stiffness_xyz_anchors,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if anchors.ndim != 2 or anchors.shape[1] != 3 or anchors.shape[0] == 0:
+                raise ValueError(
+                    "net_pull_ee_compliance_stiffness_xyz_anchors must have shape [N, 3]."
+                )
+            if torch.any(anchors <= 0.0):
+                raise ValueError("EE stiffness anchors must be positive.")
+            if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
+                stiffness_min, stiffness_max = (
+                    self.net_pull_ee_compliance_stiffness_xyz_range
+                )
+                if torch.any(anchors < stiffness_min) or torch.any(anchors > stiffness_max):
+                    raise ValueError(
+                        "EE stiffness anchors must lie inside the configured xyz range."
+                    )
+            self.net_pull_ee_compliance_stiffness_xyz_anchors = anchors
+        if self.net_pull_ee_compliance_stiffness_anchor_prob > 0.0 and (
+            self.net_pull_ee_compliance_stiffness_xyz_anchors is None
+        ):
+            raise ValueError(
+                "Positive EE stiffness anchor probability requires xyz anchors."
+            )
         self.net_pull_ee_compliance_stiffness_current = torch.empty(
             self.num_envs, 1, 3, dtype=torch.float32, device=self.device
         )
@@ -2063,11 +2158,16 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
     def _sample_net_pull_ee_compliance_stiffness(self, env_ids):
         if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
             stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_xyz_range
-            sampled = torch.empty(env_ids.numel(), 1, 3, device=self.device).uniform_(0.0, 1.0)
-            sampled = stiffness_min.reshape(1, 1, 3) + sampled * (
-                stiffness_max - stiffness_min
-            ).reshape(1, 1, 3)
-            self.net_pull_ee_compliance_stiffness_current[env_ids] = sampled
+            sampled = sample_mixed_xyz_stiffness(
+                env_ids.numel(),
+                stiffness_min,
+                stiffness_max,
+                levels=self.net_pull_ee_compliance_stiffness_levels,
+                levels_prob=self.net_pull_ee_compliance_stiffness_levels_prob,
+                anchors=self.net_pull_ee_compliance_stiffness_xyz_anchors,
+                anchor_prob=self.net_pull_ee_compliance_stiffness_anchor_prob,
+            )
+            self.net_pull_ee_compliance_stiffness_current[env_ids, 0] = sampled
             return
         if self.net_pull_ee_compliance_stiffness_range is None:
             self._set_net_pull_ee_compliance_stiffness_fixed(env_ids)

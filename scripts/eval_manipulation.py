@@ -107,7 +107,7 @@ def _policy_source_label(args) -> str:
     return args.run_path or args.checkpoint or getattr(args, "moe_experts_config", None) or "unknown"
 
 
-def _configure_evaluation_compiler(args) -> None:
+def _configure_evaluation_compiler(args, *, force: bool = False) -> None:
     """Keep deploy/evaluation inference out of TorchInductor.
 
     The analytical MoE executes seven frozen high-level policies and the
@@ -120,13 +120,13 @@ def _configure_evaluation_compiler(args) -> None:
     ``set_stance`` was added after the first PyTorch 2.x releases; retain a
     no-op fallback so this script remains usable with older environments.
     """
-    if not getattr(args, "moe_experts_config", None):
+    if not force and not getattr(args, "moe_experts_config", None):
         return
 
     set_stance = getattr(getattr(torch, "compiler", None), "set_stance", None)
     if set_stance is None:
         print(
-            "[Info] Analytical MoE eval: torch.compiler.set_stance is unavailable; "
+            "[Info] MoE eval: torch.compiler.set_stance is unavailable; "
             "using the environment's default compiler behavior.",
             flush=True,
         )
@@ -135,7 +135,7 @@ def _configure_evaluation_compiler(args) -> None:
     if not _MOE_EAGER_CONFIGURED:
         set_stance("force_eager")
     print(
-        "[Info] Analytical MoE eval: TorchInductor disabled; using eager inference.",
+        "[Info] MoE eval: TorchInductor disabled; using eager inference.",
         flush=True,
     )
 
@@ -2515,6 +2515,12 @@ def main():
     else:
         print("Error: no policy source was selected.")
         sys.exit(1)
+
+    algo_target = str(cfg.get("algo", {}).get("_target_", ""))
+    if "LearnedMoEPolicy" in algo_target:
+        # Learned-MoE checkpoints are selected through --run_path, so they
+        # cannot be detected during the early argv-only compiler setup.
+        _configure_evaluation_compiler(args, force=True)
 
     # Note: UdpTeleopReceiver is already started by default in MotionTrackingCommand
     # The robot will listen on UDP port 15000 for teleoperation commands
