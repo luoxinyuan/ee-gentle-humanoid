@@ -9,6 +9,7 @@ from active_adaptation.learning.hierarchical.root_student_force_learned_moe impo
     ANALYTICAL_GATE_WEIGHTS_KEY,
     EXPERT_ACTIONS_KEY,
     GATE_WEIGHTS_KEY,
+    REUSE_EXPERT_ACTIONS_KEY,
     AnalyticalResidualGate,
     LearnedMoEActorCore,
     RootStudentForceLearnedMoEPolicy,
@@ -51,7 +52,7 @@ class _FakeExpert:
         action = torch.full(
             (*tensordict.batch_size, 6),
             0.05 * expert_index,
-        )
+        ) + tensordict["hl_policy"][..., 0:1]
         return TensorDict(
             {
                 "action": action,
@@ -116,7 +117,7 @@ class RootStudentForceLearnedMoETest(unittest.TestCase):
             analytical_gate_kl(analytical, learned), torch.zeros(5, 3)
         )
 
-    def test_actor_core_caches_frozen_expert_actions_for_ppo_updates(self):
+    def test_actor_core_refreshes_rollout_and_reuses_only_when_explicit(self):
         _FakeExpert.calls = 0
         cfg = {
             "in_keys": ["hl_policy", "hl_moe"],
@@ -153,9 +154,26 @@ class RootStudentForceLearnedMoETest(unittest.TestCase):
             tensordict[GATE_WEIGHTS_KEY],
             tensordict[ANALYTICAL_GATE_WEIGHTS_KEY],
         )
+        first_actions = tensordict[EXPERT_ACTIONS_KEY].clone()
 
+        # The cached output key survives in a rollout TensorDict, but without
+        # an explicit PPO reuse marker it must be overwritten with fresh
+        # expert inference for the new observation.
+        tensordict["hl_policy"][..., 0] = 0.1
         actor(tensordict)
-        self.assertEqual(_FakeExpert.calls, len(EXPERT_NAMES))
+        self.assertEqual(_FakeExpert.calls, 2 * len(EXPERT_NAMES))
+        self.assertFalse(torch.equal(first_actions, tensordict[EXPERT_ACTIONS_KEY]))
+        refreshed_actions = tensordict[EXPERT_ACTIONS_KEY].clone()
+
+        tensordict[REUSE_EXPERT_ACTIONS_KEY] = torch.ones(
+            2, 1, dtype=torch.bool
+        )
+        tensordict["hl_policy"][..., 0] = 0.2
+        actor(tensordict)
+        self.assertEqual(_FakeExpert.calls, 2 * len(EXPERT_NAMES))
+        torch.testing.assert_close(
+            tensordict[EXPERT_ACTIONS_KEY], refreshed_actions
+        )
 
     def test_stiffness_only_gate_uses_three_command_features(self):
         cfg = {

@@ -35,6 +35,7 @@ from active_adaptation.learning.ppo.common import (
 
 
 EXPERT_ACTIONS_KEY = "moe_expert_raw_actions"
+REUSE_EXPERT_ACTIONS_KEY = "_moe_reuse_expert_raw_actions"
 GATE_WEIGHTS_KEY = "moe_gate_weights"
 ANALYTICAL_GATE_WEIGHTS_KEY = "moe_analytical_gate_weights"
 
@@ -266,7 +267,21 @@ class LearnedMoEActorCore(TensorDictModuleBase):
         return raw_actions, expert_outputs
 
     def forward(self, tensordict: TensorDict) -> TensorDict:
-        if EXPERT_ACTIONS_KEY in tensordict.keys():
+        # TorchRL carries unknown root TensorDict keys across environment
+        # steps. Therefore, the mere presence of EXPERT_ACTIONS_KEY does not
+        # mean that it belongs to the current observation. Rollout/eval always
+        # refreshes all experts; only PPO update minibatches explicitly opt in
+        # to reusing the actions saved for that same transition.
+        reuse_flag = tensordict.get(REUSE_EXPERT_ACTIONS_KEY, None)
+        reuse_expert_actions = (
+            reuse_flag is not None and bool(reuse_flag.all().item())
+        )
+        if reuse_expert_actions:
+            if EXPERT_ACTIONS_KEY not in tensordict.keys():
+                raise RuntimeError(
+                    "PPO requested cached learned-MoE expert actions, but the "
+                    f"minibatch has no {EXPERT_ACTIONS_KEY!r}."
+                )
             raw_actions = self._unpack_expert_actions(tensordict[EXPERT_ACTIONS_KEY])
             expert_outputs = None
         else:
@@ -496,6 +511,11 @@ class RootStudentForceLearnedMoEPolicy(TensorDictModuleBase):
         valid = ~minibatch["is_init"]
 
         minibatch = minibatch.exclude("next", "sample_log_prob", ACTION_KEY)
+        minibatch[REUSE_EXPERT_ACTIONS_KEY] = torch.ones(
+            (*minibatch.batch_size, 1),
+            dtype=torch.bool,
+            device=minibatch.device,
+        )
         self.actor(minibatch)
         values = self.critic(minibatch)["state_value"]
 
