@@ -1681,6 +1681,7 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         net_pull_ee_compliance_stiffness_levels_prob: float = 0.0,
         net_pull_ee_compliance_stiffness_xyz_anchors: Sequence[Sequence[float]] | None = None,
         net_pull_ee_compliance_stiffness_anchor_prob: float = 0.0,
+        net_pull_ee_compliance_stiffness_inverse_command: bool = False,
         net_pull_ee_compliance_max_offset: float = 0.25,
         net_pull_ee_compliance_force_deadband: float = 5.0,
         use_net_pull_ee_target_for_tracking: bool = False,
@@ -1962,6 +1963,9 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
         self.net_pull_ee_compliance_stiffness_xyz_anchors = None
         self.net_pull_ee_compliance_stiffness_anchor_prob = float(
             net_pull_ee_compliance_stiffness_anchor_prob
+        )
+        self.net_pull_ee_compliance_stiffness_inverse_command = bool(
+            net_pull_ee_compliance_stiffness_inverse_command
         )
         if not 0.0 <= self.net_pull_ee_compliance_stiffness_levels_prob <= 1.0:
             raise ValueError(
@@ -3431,15 +3435,23 @@ class MotionTrackingCommand_impedance(MotionTrackingCommand):
 
     @observation
     def net_pull_ee_compliance_stiffness_command(self):
-        """Normalized EE stiffness command for scalar or xyz range tasks."""
+        """EE stiffness command for scalar or xyz range tasks.
+
+        New ablations can request the direct reciprocal ``1 / k`` command.
+        The default path remains the original normalized stiffness command.
+        """
         if self.net_pull_ee_compliance_stiffness_xyz_range is not None:
             stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_xyz_range
             stiffness = self.net_pull_ee_compliance_stiffness_current[:, 0, :]
+            if self.net_pull_ee_compliance_stiffness_inverse_command:
+                return 1.0 / stiffness.clamp_min(1e-6)
             return 2.0 * (stiffness - stiffness_min) / (stiffness_max - stiffness_min) - 1.0
         if self.net_pull_ee_compliance_stiffness_range is None:
             return torch.zeros(self.num_envs, 1, device=self.device)
         stiffness_min, stiffness_max = self.net_pull_ee_compliance_stiffness_range
         stiffness = self.net_pull_ee_compliance_stiffness_current[:, 0, 0:1]
+        if self.net_pull_ee_compliance_stiffness_inverse_command:
+            return 1.0 / stiffness.clamp_min(1e-6)
         return 2.0 * (stiffness - stiffness_min) / (stiffness_max - stiffness_min) - 1.0
 
     def net_pull_ee_compliance_stiffness_command_sym(self):
