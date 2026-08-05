@@ -2,10 +2,11 @@
 set -euo pipefail
 
 PROJECT="luoxinyuan-duke-university/gentle_humanoid"
-TASK="G1/G1_gentle_3kp_ee_range"
-TRAIN_RUN="gentle_3kp_ee_range_train"
-ADAPT_RUN="gentle_3kp_ee_range_adapt"
-FINETUNE_RUN="gentle_3kp_ee_range_finetune"
+# Low-level EE policy with independently sampled kx/ky/kz in [200, 600] N/m.
+TASK="G1/G1_gentle_3kp_ee_xyz_range_200_600"
+TRAIN_RUN="gentle_3kp_ee_xyz_range_200_600_train"
+ADAPT_RUN="gentle_3kp_ee_xyz_range_200_600_adapt"
+FINETUNE_RUN="gentle_3kp_ee_xyz_range_200_600_finetune"
 CUDA_DEVICES="0,1,2,3"
 MASTER_PORT="29501"
 NPROC="4"

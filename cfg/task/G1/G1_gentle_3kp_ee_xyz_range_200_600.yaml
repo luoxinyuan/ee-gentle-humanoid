@@ -1,0 +1,40 @@
+name: G1GENTLE3KPEEXYZRANGE200600
+
+defaults:
+  - /task/G1/G1_gentle_3kp_ee_net_pull_force_b@_here_
+  - _self_
+
+command:
+  # Independently sample kx, ky, and kz from [200, 600] N/m.
+  # This is deliberately different from G1_gentle_3kp_ee_range.yaml,
+  # whose scalar command is shared by all three axes.
+  net_pull_ee_compliance_stiffness_xyz_range:
+    - [200.0, 200.0, 200.0]
+    - [600.0, 600.0, 600.0]
+  # Preserve coverage of useful intermediate and mixed-axis commands while
+  # retaining continuous sampling for the rest of the range.
+  net_pull_ee_compliance_stiffness_levels:
+    [200.0, 250.0, 300.0, 400.0, 500.0, 550.0, 600.0]
+  net_pull_ee_compliance_stiffness_levels_prob: 0.30
+  net_pull_ee_compliance_stiffness_xyz_anchors:
+    - [200.0, 200.0, 200.0]
+    - [600.0, 600.0, 600.0]
+    - [200.0, 600.0, 600.0]
+    - [600.0, 200.0, 600.0]
+    - [600.0, 600.0, 200.0]
+    - [250.0, 400.0, 550.0]
+    - [250.0, 550.0, 400.0]
+    - [400.0, 250.0, 550.0]
+    - [400.0, 550.0, 250.0]
+    - [550.0, 250.0, 400.0]
+    - [550.0, 400.0, 250.0]
+  net_pull_ee_compliance_stiffness_anchor_prob: 0.20
+  synthetic_ee_target:
+    enabled: true
+    train_only: true
+    prob: 0.25
+
+observation:
+  policy:
+    # Three normalized values [kx, ky, kz] in [-1, 1].
+    net_pull_ee_compliance_stiffness_command: {}
