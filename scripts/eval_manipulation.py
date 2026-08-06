@@ -25,19 +25,19 @@ import datetime
 import re
 
 # ``active_adaptation.learning`` is imported below by the evaluation helpers.
-# It contains a couple of training-time ``@torch.compile`` decorators, which
-# are materialized during import.  The compiler stance therefore has to be set
-# before importing those helpers; setting it later in ``main()`` is too late.
-_MOE_EAGER_CONFIGURED = False
-if "--moe_experts_config" in sys.argv or "--moe-experts-config" in sys.argv:
-    # PPO's compiled helpers are training-only.  Set this before importing
-    # active_adaptation.learning so their decorators become no-ops for MoE
-    # deployment instead of creating an Inductor worker pool at import time.
-    os.environ["ACTIVE_ADAPTATION_DISABLE_TORCH_COMPILE"] = "1"
-    _set_compiler_stance = getattr(getattr(torch, "compiler", None), "set_stance", None)
-    if _set_compiler_stance is not None:
-        _set_compiler_stance("force_eager")
-        _MOE_EAGER_CONFIGURED = True
+# It contains training-time ``@torch.compile`` decorators, which are
+# materialized during import.  Evaluation never executes PPO optimisation, so
+# these helpers must remain eager for *all* deployment policies, including a
+# plain PPOPolicy checkpoint such as the ranged low-level policy.  Previously
+# this was enabled only for the analytical-MoE command, which left ordinary
+# ranged low-level evaluation spawning a large TorchInductor compile pool on
+# its first rollout.
+_EVAL_EAGER_CONFIGURED = False
+os.environ["ACTIVE_ADAPTATION_DISABLE_TORCH_COMPILE"] = "1"
+_set_compiler_stance = getattr(getattr(torch, "compiler", None), "set_stance", None)
+if _set_compiler_stance is not None:
+    _set_compiler_stance("force_eager")
+    _EVAL_EAGER_CONFIGURED = True
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -97,7 +97,10 @@ def _default_ee_report_path(args, prefix: str) -> str:
         policy_name = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     stiffness_values = getattr(args, "ee_compliance_stiffness", None)
     stiffness_suffix = ""
-    if prefix.startswith("ee_compliance") and stiffness_values is not None:
+    if (
+        (prefix.startswith("ee_compliance") or prefix.startswith("ee_bimanual_compliance"))
+        and stiffness_values is not None
+    ):
         stiffness_token = "_".join(f"{value:g}" for value in stiffness_values)
         stiffness_suffix = f"_k{_safe_report_name(stiffness_token)}"
     return os.path.join("outputs", f"{prefix}_{policy_name}{stiffness_suffix}.json")
@@ -110,32 +113,29 @@ def _policy_source_label(args) -> str:
 def _configure_evaluation_compiler(args, *, force: bool = False) -> None:
     """Keep deploy/evaluation inference out of TorchInductor.
 
-    The analytical MoE executes seven frozen high-level policies and the
-    hierarchical action manager executes the low-level policy in the same
-    rollout.  A compiled function in either checkpoint can otherwise trigger
-    a very large first-call Inductor compilation, leaving the EE sweep with
-    no visible progress.  Evaluation does not benefit from training-time
-    compilation, so force eager execution for the MoE deployment path.
+    The analytical MoE, ranged high-level policy, and ranged low-level
+    ``PPOPolicy`` can all import PPO helpers containing training-only compiled
+    functions.  A compiled function can trigger a very large first-call
+    Inductor compilation, leaving the EE sweep with no visible progress.
+    Evaluation does not benefit from training-time compilation, so force eager
+    execution for every deployment policy.
 
     ``set_stance`` was added after the first PyTorch 2.x releases; retain a
     no-op fallback so this script remains usable with older environments.
     """
-    if not force and not getattr(args, "moe_experts_config", None):
-        return
-
     set_stance = getattr(getattr(torch, "compiler", None), "set_stance", None)
     if set_stance is None:
         print(
-            "[Info] MoE eval: torch.compiler.set_stance is unavailable; "
-            "using the environment's default compiler behavior.",
+            "[Info] Evaluation: torch.compiler.set_stance is unavailable; "
+            "training-time torch.compile is disabled through the environment.",
             flush=True,
         )
         return
 
-    if not _MOE_EAGER_CONFIGURED:
+    if not _EVAL_EAGER_CONFIGURED:
         set_stance("force_eager")
     print(
-        "[Info] MoE eval: TorchInductor disabled; using eager inference.",
+        "[Info] Evaluation: TorchInductor disabled; using eager inference.",
         flush=True,
     )
 
@@ -241,6 +241,8 @@ def _param_tensor(value, device: torch.device) -> torch.Tensor:
 
 def _format_scalar_or_xyz(value) -> str:
     if isinstance(value, list):
+        if value and isinstance(value[0], list):
+            return "[" + ", ".join(_format_scalar_or_xyz(item) for item in value) + "]"
         return "[" + ", ".join(f"{v:.2f}" for v in value) + "]"
     return f"{float(value):.2f}"
 
@@ -269,7 +271,7 @@ def _mean_window_steps(base_env, window_sec: float = EE_EVAL_MEAN_WINDOW_SEC) ->
     return max(1, int(round(window_sec / step_dt)))
 
 
-def _get_ee_compliance_params(cfg) -> dict:
+def _get_ee_compliance_params(cfg, force_deadband_override: float | None = None) -> dict:
     reward_cfg = OmegaConf.select(cfg, "task.reward.ee_compliance.ee_force_compliance_tracking")
     found = reward_cfg is not None
     reward_cfg = reward_cfg or {}
@@ -277,12 +279,27 @@ def _get_ee_compliance_params(cfg) -> dict:
         "found_in_cfg": found,
         "stiffness": _cfg_number_or_list(reward_cfg.get("stiffness", 60.0)),
         "max_offset": _cfg_number_or_list(reward_cfg.get("max_offset", 0.25)),
-        "force_deadband": float(reward_cfg.get("force_deadband", 2.0)),
+        "force_deadband": (
+            float(force_deadband_override)
+            if force_deadband_override is not None
+            else float(reward_cfg.get("force_deadband", 2.0))
+        ),
     }
 
 
-def _prompt_low_level_nominal_stiffness(compliance_params: dict, command_manager, action_manager) -> None:
+def _prompt_low_level_nominal_stiffness(
+    compliance_params: dict,
+    command_manager,
+    action_manager,
+    explicit_stiffness: list[float] | None = None,
+) -> None:
     if _is_hierarchical_action_manager(action_manager):
+        return
+    # A command-line stiffness is authoritative for scripted evaluation.  Do
+    # not enter the interactive low-level prompt in that case: the old order
+    # made ``--ee_compliance_stiffness`` appear ineffective and blocked
+    # headless/ranged low-level evaluations waiting on stdin.
+    if explicit_stiffness is not None:
         return
     default = compliance_params["stiffness"]
     if hasattr(command_manager, "get_net_pull_ee_compliance_stiffness"):
@@ -344,10 +361,11 @@ def _set_explicit_eval_stiffness(
     """
     if stiffness_values is None:
         return
-    if len(stiffness_values) not in (1, 3):
-        raise ValueError(
-            "--ee_compliance_stiffness expects one isotropic value or three xyz values."
-        )
+    per_ee = bool(getattr(command_manager, "net_pull_ee_compliance_stiffness_per_ee", False))
+    valid_lengths = (1, 2, 3, 6) if per_ee else (1, 3)
+    if len(stiffness_values) not in valid_lengths:
+        expected = "one, two, three, or six values" if per_ee else "one isotropic value or three xyz values"
+        raise ValueError(f"--ee_compliance_stiffness expects {expected}.")
     stiffness = float(stiffness_values[0]) if len(stiffness_values) == 1 else [float(v) for v in stiffness_values]
     if not hasattr(command_manager, "set_net_pull_ee_compliance_stiffness"):
         raise RuntimeError(
@@ -357,6 +375,27 @@ def _set_explicit_eval_stiffness(
     command_manager.set_net_pull_ee_compliance_stiffness(stiffness)
     compliance_params["stiffness"] = stiffness
     compliance_params["found_in_cfg"] = True
+
+
+def _validate_explicit_eval_stiffness(cfg, stiffness_values: list[float] | None) -> None:
+    """Reject directional commands for policies trained with scalar stiffness input."""
+    if stiffness_values is None:
+        return
+    command_cfg = cfg.get("task", {}).get("command", {})
+    scalar_range = command_cfg.get("net_pull_ee_compliance_stiffness_range", None)
+    xyz_range = command_cfg.get("net_pull_ee_compliance_stiffness_xyz_range", None)
+    if scalar_range is None or xyz_range is not None:
+        return
+    values = [float(value) for value in stiffness_values]
+    if len(values) == 3 and not all(abs(value - values[0]) < 1e-6 for value in values[1:]):
+        raise ValueError(
+            "This policy is configured with scalar stiffness range "
+            f"[{float(scalar_range[0]):g}, {float(scalar_range[1]):g}], so it only "
+            "accepts an isotropic --ee_compliance_stiffness value (for example "
+            "--ee_compliance_stiffness 300). Directional xyz commands such as "
+            "300 600 600 require a policy trained with "
+            "net_pull_ee_compliance_stiffness_xyz_range."
+        )
 
 
 def _restore_explicit_eval_stiffness(
@@ -446,6 +485,31 @@ def _make_force_stiffness_ee_command(
     return command
 
 
+def _set_oracle_force_stiffness_target(
+    command_manager,
+    action_manager,
+    reference_command: torch.Tensor,
+    nominal_target_b: torch.Tensor,
+    oracle_force_b: torch.Tensor,
+    params: dict,
+):
+    """Write the ground-truth ``nominal + F/K`` target used by the oracle baseline.
+
+    This deliberately does not read ``direct_priv_pred`` or any other policy
+    output.  ``oracle_force_b`` is the force scripted by the evaluator (or the
+    force applied by the command manager), so this path is usable with the raw
+    stiff low-level policy as well as with a hierarchical action manager.
+    """
+    command = _make_force_stiffness_ee_command(
+        reference_command,
+        nominal_target_b,
+        oracle_force_b,
+        params,
+    )
+    _set_ee_eval_target(command_manager, action_manager, command)
+    return command
+
+
 def _set_ee_force_stiffness_ablation_from_policy_td(
     action_manager,
     command_manager,
@@ -494,12 +558,15 @@ def _get_ee_compliance_eval_info(command_manager, params: dict, use_command_mana
     ):
         actual_stiffness = params["stiffness"]
         if hasattr(command_manager, "get_net_pull_ee_compliance_stiffness"):
-            stiffness_tensor = command_manager.get_net_pull_ee_compliance_stiffness()[0, 0].detach().float().cpu()
-            actual_stiffness = (
-                float(stiffness_tensor[0].item())
-                if torch.allclose(stiffness_tensor, stiffness_tensor[0].expand_as(stiffness_tensor))
-                else [float(v) for v in stiffness_tensor.tolist()]
-            )
+            stiffness_tensor = command_manager.get_net_pull_ee_compliance_stiffness()[0].detach().float().cpu()
+            if stiffness_tensor.shape[0] == 2:
+                actual_stiffness = [[float(v) for v in hand.tolist()] for hand in stiffness_tensor]
+            else:
+                actual_stiffness = (
+                    float(stiffness_tensor[0, 0].item())
+                    if torch.allclose(stiffness_tensor[0], stiffness_tensor[0, 0].expand_as(stiffness_tensor[0]))
+                    else [float(v) for v in stiffness_tensor[0].tolist()]
+                )
         elif hasattr(command_manager, "net_pull_ee_compliance_stiffness"):
             stiffness_tensor = command_manager.net_pull_ee_compliance_stiffness.detach().float().reshape(-1).cpu()
             actual_stiffness = (
@@ -860,7 +927,9 @@ def evaluate_ee_tracking(cfg, args):
             print("Default feet command enabled for EE tracking eval.", flush=True)
         default_pos_b, default_quat_b = _body_pose_in_root_frame(asset, body_ids)
         sample_center_b = _get_ee_sample_center(default_pos_b, base_env.device)
-        compliance_params = _get_ee_compliance_params(cfg)
+        compliance_params = _get_ee_compliance_params(
+            cfg, getattr(args, "ee_compliance_force_deadband", None)
+        )
         use_command_manager_compliance_target = _is_hierarchical_action_manager(action_manager)
         compliance_eval_info = _get_ee_compliance_eval_info(
             command_manager,
@@ -1529,6 +1598,248 @@ def evaluate_root_compliance(cfg, args):
         simulation_app.close()
 
 
+def evaluate_ee_bimanual_compliance(cfg, args):
+    """Evaluate both EEs under the same force sweep in each environment.
+
+    This is intentionally a separate mode: the historical EE compliance eval
+    applies force to one hand at a time and its report schema is preserved.
+    The bimanual mode expects a per-EE stiffness command and reports each hand
+    independently as well as the combined result.
+    """
+    OmegaConf.resolve(cfg)
+    OmegaConf.set_struct(cfg, False)
+    app_launcher = AppLauncher(cfg.app)
+    simulation_app = app_launcher.app
+    env = None
+    try:
+        env, policy, _vecnorm, _ = make_env_policy(cfg)
+        rollout_policy = policy.get_rollout_policy("eval")
+        base_env = env.base_env if hasattr(env, "base_env") else env
+        asset = base_env.scene["robot"]
+        command_manager = base_env.command_manager
+        action_manager = base_env.action_manager
+        _set_external_force(command_manager, True)
+        if not hasattr(command_manager, "set_eval_bimanual_ee_force_b"):
+            raise RuntimeError(
+                "Bimanual EE compliance eval requires the updated MotionTrackingCommand_impedance."
+            )
+
+        body_names = [name.strip() for name in EE_TRACKING_BODY_NAMES.split(",")]
+        body_ids = [asset.body_names.index(name) for name in body_names]
+        td_ = env.reset()
+        _disable_eval_timer_reset(base_env)
+        _set_static_root_command(command_manager, asset)
+        _set_default_feet_command(command_manager, asset)
+
+        default_pos_b, default_quat_b = _body_pose_in_root_frame(asset, body_ids)
+        sample_center_b = _get_ee_sample_center(default_pos_b, base_env.device)
+        target_quat_b = torch.zeros_like(default_quat_b)
+        target_quat_b[..., 0] = 1.0
+        target_axis_angle_b = torch.zeros(base_env.num_envs, 2, 3, device=base_env.device)
+        target_rpy_b = torch.zeros(base_env.num_envs, 2, 3, device=base_env.device)
+        default_command = torch.cat(
+            [sample_center_b.reshape(base_env.num_envs, 6), target_axis_angle_b.reshape(base_env.num_envs, 6)],
+            dim=-1,
+        )
+        _set_ee_eval_target(command_manager, action_manager, default_command)
+
+        compliance_params = _get_ee_compliance_params(
+            cfg, getattr(args, "ee_compliance_force_deadband", None)
+        )
+        _set_explicit_eval_stiffness(
+            getattr(args, "ee_compliance_stiffness", None), compliance_params, command_manager
+        )
+        _refresh_moe_stiffness_observation(td_, command_manager)
+        use_command_manager_target = (
+            getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
+            and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
+        )
+        compliance_eval_info = _get_ee_compliance_eval_info(
+            command_manager, compliance_params, use_command_manager_target=use_command_manager_target
+        )
+        mean_window_steps = min(_mean_window_steps(base_env), EE_COMPLIANCE_HOLD_STEPS)
+        baseline_window_steps = min(mean_window_steps, EE_COMPLIANCE_BASELINE_STEPS)
+        directions = [
+            (name, torch.tensor(vec, dtype=torch.float32, device=base_env.device))
+            for name, vec in EE_COMPLIANCE_FORCE_DIRECTIONS
+        ]
+        case_specs = [
+            {"direction_name": name, "direction_b": direction_b, "force_n": magnitude}
+            for name, direction_b in directions
+            for magnitude in EE_COMPLIANCE_FORCE_MAGNITUDES
+        ]
+        records = []
+        batch_size = min(max(1, int(getattr(args, "ee_compliance_num_envs", 1))), base_env.num_envs)
+
+        with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
+            command_manager.clear_eval_ee_force()
+            for _ in range(EE_TRACKING_WARMUP_STEPS):
+                _, td_ = _rollout_one_step(env, rollout_policy, td_, "bimanual compliance warmup")
+
+            for batch_start in range(0, len(case_specs), batch_size):
+                batch_cases = case_specs[batch_start: batch_start + batch_size]
+                active_envs = len(batch_cases)
+                env_ids = torch.arange(active_envs, device=base_env.device)
+                td_ = env.reset()
+                _disable_eval_timer_reset(base_env)
+                _restore_explicit_eval_stiffness(getattr(args, "ee_compliance_stiffness", None), command_manager)
+                _refresh_moe_stiffness_observation(td_, command_manager)
+                _set_static_root_command(command_manager, asset)
+                _set_default_feet_command(command_manager, asset)
+                _set_ee_eval_target(command_manager, action_manager, default_command)
+
+                for _ in range(EE_TRACKING_WARMUP_STEPS):
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "bimanual compliance warmup")
+
+                baseline_pos_samples = []
+                for step in range(EE_COMPLIANCE_BASELINE_STEPS):
+                    command_manager.clear_eval_ee_force()
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "bimanual compliance baseline")
+                    if step >= EE_COMPLIANCE_BASELINE_STEPS - baseline_window_steps:
+                        baseline_pos_samples.append(_body_pose_in_root_frame(asset, body_ids)[0])
+                baseline_pos_b = _mean_tensor_samples(baseline_pos_samples)
+
+                for ramp_step in range(EE_COMPLIANCE_RAMP_STEPS):
+                    force = torch.stack([
+                        case["direction_b"] * case["force_n"] * float(ramp_step + 1) / EE_COMPLIANCE_RAMP_STEPS
+                        for case in batch_cases
+                    ], dim=0)
+                    command_manager.set_eval_bimanual_ee_force_b(
+                        force.unsqueeze(1).expand(-1, 2, -1), env_ids=env_ids
+                    )
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "bimanual compliance ramp")
+
+                pos_samples = [[] for _ in batch_cases]
+                target_samples = [[] for _ in batch_cases]
+                force_samples = [[] for _ in batch_cases]
+                for hold_step in range(EE_COMPLIANCE_HOLD_STEPS):
+                    force = torch.stack([
+                        case["direction_b"] * case["force_n"] for case in batch_cases
+                    ], dim=0)
+                    command_manager.set_eval_bimanual_ee_force_b(
+                        force.unsqueeze(1).expand(-1, 2, -1), env_ids=env_ids
+                    )
+                    _, td_ = _rollout_one_step(env, rollout_policy, td_, "bimanual compliance hold")
+                    if hold_step >= EE_COMPLIANCE_HOLD_STEPS - mean_window_steps:
+                        actual_pos_b = _body_pose_in_root_frame(asset, body_ids)[0]
+                        for env_i, case in enumerate(batch_cases):
+                            target_b, _, force_b = _compute_ee_compliance_target_b(
+                                command_manager, asset, body_ids, sample_center_b,
+                                compliance_params, env_ids=env_ids[env_i:env_i + 1],
+                                use_command_manager_target=use_command_manager_target,
+                            )
+                            pos_samples[env_i].append(actual_pos_b[env_ids[env_i]:env_ids[env_i] + 1])
+                            target_samples[env_i].append(target_b)
+                            force_samples[env_i].append(force_b)
+
+                active_stiffness = command_manager.get_net_pull_ee_compliance_stiffness()[0].detach().cpu()
+                for env_i, case in enumerate(batch_cases):
+                    actual_pos_b = _mean_tensor_samples(pos_samples[env_i])
+                    target_b = _mean_tensor_samples(target_samples[env_i])
+                    force_b = _mean_tensor_samples(force_samples[env_i])
+                    nominal_delta_b = actual_pos_b - sample_center_b[env_ids[env_i]:env_ids[env_i] + 1]
+                    compliance_delta_b = actual_pos_b - target_b
+                    nominal_error = nominal_delta_b.norm(dim=-1)[0]
+                    compliance_error = compliance_delta_b.norm(dim=-1)[0]
+                    measured = []
+                    for ee_i in range(2):
+                        displacement = ((actual_pos_b[0, ee_i] - baseline_pos_b[env_ids[env_i], ee_i]) * case["direction_b"]).sum()
+                        measured.append(case["force_n"] / abs(float(displacement)) if abs(float(displacement)) > 1e-5 else float("nan"))
+                    records.append({
+                        "direction": case["direction_name"],
+                        "force_n": case["force_n"],
+                        "nominal_position_error_m": nominal_error.tolist(),
+                        "compliance_position_error_m": compliance_error.tolist(),
+                        "measured_stiffness_abs_n_per_m": measured,
+                        "target_stiffness_n_per_m": active_stiffness.tolist(),
+                        "ee_force_b": force_b[0].tolist(),
+                    })
+                    print(
+                        f"both {case['direction_name']:>2s} {case['force_n']:>4.0f}N [env {batch_start + env_i:02d}]: "
+                        f"left_comp={compliance_error[0].item():.4f} m, right_comp={compliance_error[1].item():.4f} m, "
+                        f"k_left={measured[0]:.1f}, k_right={measured[1]:.1f} N/m",
+                        flush=True,
+                    )
+
+        nominal = torch.tensor([record["nominal_position_error_m"] for record in records])
+        compliance = torch.tensor([record["compliance_position_error_m"] for record in records])
+        measured = torch.tensor([record["measured_stiffness_abs_n_per_m"] for record in records])
+        target = torch.tensor([record["target_stiffness_n_per_m"] for record in records])
+        axis_names = ("x", "y", "z")
+        measured_xyz_summary = {"left": {}, "right": {}}
+        stiffness_error_xyz_summary = {"left": {}, "right": {}}
+        stiffness_mae_xyz = {"left": {}, "right": {}}
+        for ee_i, ee_name in enumerate(("left", "right")):
+            all_abs_errors = []
+            for axis_i, axis_name in enumerate(axis_names):
+                axis_mask = torch.tensor(
+                    [record["direction"].endswith(axis_name) for record in records],
+                    dtype=torch.bool,
+                )
+                axis_measured = measured[axis_mask, ee_i]
+                axis_target = target[axis_mask, ee_i, axis_i]
+                axis_error = axis_measured - axis_target
+                axis_abs_error = axis_error.abs()
+                measured_xyz_summary[ee_name][axis_name] = _summary(axis_measured)
+                stiffness_error_xyz_summary[ee_name][axis_name] = _summary(axis_error)
+                stiffness_mae_xyz[ee_name][axis_name] = float(axis_abs_error.mean().item())
+                all_abs_errors.append(axis_abs_error)
+            all_abs_errors = torch.cat(all_abs_errors)
+            stiffness_mae_xyz[ee_name]["overall"] = float(all_abs_errors.mean().item())
+        report = {
+            "mode": "bimanual_ee_compliance",
+            "policy_source": _policy_source_label(args),
+            "summary": {
+                "nominal_position_error_m": {"left": _summary(nominal[:, 0]), "right": _summary(nominal[:, 1]), "combined": _summary(nominal)},
+                "compliance_position_error_m": {"left": _summary(compliance[:, 0]), "right": _summary(compliance[:, 1]), "combined": _summary(compliance)},
+                "measured_stiffness_abs_n_per_m": {"left": _summary(measured[:, 0]), "right": _summary(measured[:, 1]), "combined": _summary(measured)},
+                "measured_stiffness_abs_n_per_m_xyz": measured_xyz_summary,
+                "stiffness_error_n_per_m_xyz": stiffness_error_xyz_summary,
+                "stiffness_mae_n_per_m_xyz": stiffness_mae_xyz,
+                "target_stiffness_n_per_m": {"left": target[0, 0].tolist(), "right": target[0, 1].tolist()},
+            },
+            "records": records,
+        }
+        if args.ee_output is None:
+            args.ee_output = _default_ee_report_path(args, "ee_bimanual_compliance_eval")
+        os.makedirs(os.path.dirname(args.ee_output) or ".", exist_ok=True)
+        with open(args.ee_output, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        print("\n" + "=" * 60)
+        print("BIMANUAL EE COMPLIANCE EVAL")
+        print("=" * 60)
+        for name, values in (("Nominal", nominal), ("Compliance", compliance), ("Measured stiffness", measured)):
+            print(
+                f"  {name} left mean±std: {values[:, 0].mean():.4f} ± {values[:, 0].std(unbiased=False):.4f}; "
+                f"right mean±std: {values[:, 1].mean():.4f} ± {values[:, 1].std(unbiased=False):.4f}"
+            )
+        for ee_name in ("left", "right"):
+            print(
+                f"  Measured stiffness {ee_name} xyz mean±std: "
+                + ", ".join(
+                    f"{axis}={measured_xyz_summary[ee_name][axis]['mean']:.1f} ± "
+                    f"{measured_xyz_summary[ee_name][axis]['std']:.1f}"
+                    for axis in axis_names
+                )
+                + " N/m"
+            )
+            print(
+                f"  Stiffness MAE {ee_name} xyz/overall: "
+                + ", ".join(
+                    f"{axis}={stiffness_mae_xyz[ee_name][axis]:.1f}"
+                    for axis in axis_names
+                )
+                + f", overall={stiffness_mae_xyz[ee_name]['overall']:.1f} N/m"
+            )
+        print(f"  Target stiffness left/right: {target[0, 0].tolist()} / {target[0, 1].tolist()} N/m")
+        print(f"  Report: {args.ee_output}")
+        print("=" * 60 + "\n")
+    finally:
+        if env is not None:
+            env.close()
+        simulation_app.close()
+
+
 def evaluate_ee_compliance(cfg, args):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
@@ -1578,8 +1889,15 @@ def evaluate_ee_compliance(cfg, args):
         )
         _set_ee_eval_target(command_manager, action_manager, default_command)
 
-        compliance_params = _get_ee_compliance_params(cfg)
-        _prompt_low_level_nominal_stiffness(compliance_params, command_manager, action_manager)
+        compliance_params = _get_ee_compliance_params(
+            cfg, getattr(args, "ee_compliance_force_deadband", None)
+        )
+        _prompt_low_level_nominal_stiffness(
+            compliance_params,
+            command_manager,
+            action_manager,
+            getattr(args, "ee_compliance_stiffness", None),
+        )
         _set_explicit_eval_stiffness(
             getattr(args, "ee_compliance_stiffness", None),
             compliance_params,
@@ -1587,15 +1905,27 @@ def evaluate_ee_compliance(cfg, args):
         )
         _refresh_moe_stiffness_observation(td_, command_manager)
         force_estimator_ablation = bool(getattr(args, "ee_compliance_force_estimator_ablation", False))
+        oracle_force_baseline = bool(getattr(args, "ee_compliance_oracle_force", False))
+        if force_estimator_ablation and oracle_force_baseline:
+            raise RuntimeError(
+                "--ee_compliance_force_estimator_ablation and "
+                "--ee_compliance_oracle_force are mutually exclusive."
+            )
         if force_estimator_ablation and not _is_hierarchical_action_manager(action_manager):
             raise RuntimeError(
                 "--ee_compliance_force_estimator_ablation is only supported for hierarchical policies; "
                 "low-level-only EE compliance eval is intentionally not handled."
             )
+        if oracle_force_baseline and _is_hierarchical_action_manager(action_manager):
+            raise RuntimeError(
+                "--ee_compliance_oracle_force is intended for the raw stiff low-level policy. "
+                "Use the 3kp stiff checkpoint/run directly; it must not load a high-level policy."
+            )
         if force_estimator_ablation:
             action_manager.clear_ee_force_stiffness_ablation_command()
         use_command_manager_compliance_target = (
             not force_estimator_ablation
+            and not oracle_force_baseline
             and getattr(command_manager, "external_force_mode", "legacy") == "net_pull"
             and hasattr(command_manager, "get_net_pull_ee_compliance_target_b")
         )
@@ -1606,6 +1936,9 @@ def evaluate_ee_compliance(cfg, args):
         )
         if force_estimator_ablation:
             compliance_eval_info["target_mode"] = "force_estimator_over_cfg_stiffness_ablation"
+            compliance_eval_info["actual_stiffness"] = compliance_params["stiffness"]
+        elif oracle_force_baseline:
+            compliance_eval_info["target_mode"] = "oracle_force_over_cfg_stiffness"
             compliance_eval_info["actual_stiffness"] = compliance_params["stiffness"]
         mean_window_steps = min(_mean_window_steps(base_env), EE_COMPLIANCE_HOLD_STEPS)
         baseline_window_steps = min(mean_window_steps, EE_COMPLIANCE_BASELINE_STEPS)
@@ -1622,12 +1955,30 @@ def evaluate_ee_compliance(cfg, args):
                 compliance_params,
             )
 
+        def set_oracle_target(oracle_force_b=None):
+            if not oracle_force_baseline:
+                return
+            if oracle_force_b is None:
+                oracle_force_b = torch.zeros_like(sample_center_b)
+            _set_oracle_force_stiffness_target(
+                command_manager,
+                action_manager,
+                default_command,
+                sample_center_b,
+                oracle_force_b,
+                compliance_params,
+            )
+
         print(
             "EE compliance eval target is written as "
             + (
                 "force-estimator/stiffness low-level EE command override."
                 if force_estimator_ablation
-                else ("high-level EE reference override." if _is_hierarchical_action_manager(action_manager) else "low-level EE command override.")
+                else (
+                    "oracle ground-truth-force/stiffness low-level EE command override."
+                    if oracle_force_baseline
+                    else ("high-level EE reference override." if _is_hierarchical_action_manager(action_manager) else "low-level EE command override.")
+                )
             ),
             flush=True,
         )
@@ -1643,6 +1994,12 @@ def evaluate_ee_compliance(cfg, args):
             print(
                 "EE compliance force-estimator ablation enabled: high-level EE delta is bypassed; "
                 "low-level EE command position = nominal + direct_priv_pred_force_b / cfg stiffness.",
+                flush=True,
+            )
+        if oracle_force_baseline:
+            print(
+                "EE compliance oracle-force baseline enabled: learned force estimation and high-level "
+                "EE deltas are bypassed; low-level EE command position = nominal + applied_force_b / cfg stiffness.",
                 flush=True,
             )
         print(
@@ -1670,6 +2027,7 @@ def evaluate_ee_compliance(cfg, args):
 
         with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
             command_manager.clear_eval_ee_force()
+            set_oracle_target()
             for _ in range(EE_TRACKING_WARMUP_STEPS):
                 _, td_ = _rollout_one_step(
                     env,
@@ -1684,6 +2042,7 @@ def evaluate_ee_compliance(cfg, args):
             baseline_compliance_target_samples = []
             for step in range(EE_COMPLIANCE_BASELINE_STEPS):
                 command_manager.clear_eval_ee_force()
+                set_oracle_target()
                 _, td_ = _rollout_one_step(
                     env,
                     rollout_policy,
@@ -1740,8 +2099,10 @@ def evaluate_ee_compliance(cfg, args):
                 if _set_default_feet_command(command_manager, asset):
                     pass
                 _set_ee_eval_target(command_manager, action_manager, default_command)
+                set_oracle_target()
 
                 for _ in range(EE_TRACKING_WARMUP_STEPS):
+                    set_oracle_target()
                     _, td_ = _rollout_one_step(
                         env,
                         rollout_policy,
@@ -1755,6 +2116,7 @@ def evaluate_ee_compliance(cfg, args):
                 baseline_compliance_target_samples = []
                 for step in range(EE_COMPLIANCE_BASELINE_STEPS):
                     command_manager.clear_eval_ee_force()
+                    set_oracle_target()
                     _, td_ = _rollout_one_step(
                         env,
                         rollout_policy,
@@ -1783,6 +2145,7 @@ def evaluate_ee_compliance(cfg, args):
 
                 for _ in range(EE_COMPLIANCE_RECOVERY_STEPS):
                     command_manager.clear_eval_ee_force()
+                    set_oracle_target()
                     _, td_ = _rollout_one_step(
                         env,
                         rollout_policy,
@@ -1802,6 +2165,11 @@ def evaluate_ee_compliance(cfg, args):
                         if mask.any():
                             force_b = ramp_forces[mask]
                             command_manager.set_eval_ee_force_b(ee_i, force_b, env_ids=env_ids[mask])
+                    if oracle_force_baseline:
+                        oracle_force_b = torch.zeros_like(sample_center_b)
+                        for env_i, case in enumerate(batch_cases):
+                            oracle_force_b[env_ids[env_i], case["ee_i"]] = ramp_forces[env_i]
+                        set_oracle_target(oracle_force_b)
                     _, td_ = _rollout_one_step(
                         env,
                         rollout_policy,
@@ -1828,6 +2196,11 @@ def evaluate_ee_compliance(cfg, args):
                         if mask.any():
                             force_b = torch.stack([full_forces[i] for i, m in enumerate(mask.tolist()) if m], dim=0)
                             command_manager.set_eval_ee_force_b(ee_i, force_b, env_ids=env_ids[mask])
+                    if oracle_force_baseline:
+                        oracle_force_b = torch.zeros_like(sample_center_b)
+                        for env_i, case in enumerate(batch_cases):
+                            oracle_force_b[env_ids[env_i], case["ee_i"]] = full_forces[env_i]
+                        set_oracle_target(oracle_force_b)
                     _, td_, policy_td = _rollout_one_step(
                         env,
                         rollout_policy,
@@ -2150,7 +2523,7 @@ def evaluate_ee_compliance(cfg, args):
             "run_path": args.run_path,
             "moe_experts_config": getattr(args, "moe_experts_config", None),
             "task": args.task,
-            "num_envs": args.ee_compliance_num_envs if args.ee_compliance_eval else args.num_envs,
+            "num_envs": args.ee_compliance_num_envs if (args.ee_compliance_eval or args.ee_bimanual_compliance_eval) else args.num_envs,
             "ee_body_names": body_names,
             "force_directions": EE_COMPLIANCE_FORCE_DIRECTIONS,
             "force_magnitudes_n": EE_COMPLIANCE_FORCE_MAGNITUDES,
@@ -2163,6 +2536,16 @@ def evaluate_ee_compliance(cfg, args):
             "external_force": "manual_default",
             "external_force_default_cfg": DEFAULT_EXTERNAL_FORCE_CFG,
             "ee_compliance_force_estimator_ablation": force_estimator_ablation,
+            "ee_compliance_oracle_force": oracle_force_baseline,
+            "compliance_controller": (
+                "oracle_force_over_cfg_stiffness_stiff_low_level"
+                if oracle_force_baseline
+                else (
+                    "force_estimator_over_cfg_stiffness"
+                    if force_estimator_ablation
+                    else "policy_or_command_manager"
+                )
+            ),
             "target_pos_b": sample_center_b.detach().cpu().tolist(),
             "baseline_pos_b": baseline_pos_b.detach().cpu().tolist(),
             "baseline_nominal_error_m": baseline_nominal_error.detach().cpu().tolist(),
@@ -2251,9 +2634,13 @@ def evaluate_ee_compliance(cfg, args):
 
         if args.ee_output is None:
             report_prefix = (
-                "ee_compliance_eval_force_estimator_ablation"
-                if force_estimator_ablation
-                else "ee_compliance_eval"
+                "ee_compliance_eval_oracle_force_stiff_low_level"
+                if oracle_force_baseline
+                else (
+                    "ee_compliance_eval_force_estimator_ablation"
+                    if force_estimator_ablation
+                    else "ee_compliance_eval"
+                )
             )
             args.ee_output = _default_ee_report_path(args, report_prefix)
         os.makedirs(os.path.dirname(args.ee_output) or ".", exist_ok=True)
@@ -2342,6 +2729,16 @@ def main():
     parser.add_argument("-r", "--run_path", type=str, help="WandB run path")
     parser.add_argument("--checkpoint", type=str, help="Local checkpoint path (alternative to wandb)")
     parser.add_argument(
+        "--config_file",
+        "--config-file",
+        type=str,
+        default=None,
+        help=(
+            "Local training cfg.yaml to load together with --checkpoint. "
+            "This avoids requiring W&B network access and preserves the checkpoint's policy/task config."
+        ),
+    )
+    parser.add_argument(
         "--moe_experts_config",
         "--moe-experts-config",
         type=str,
@@ -2366,6 +2763,13 @@ def main():
                         help="Evaluate EE tracking accuracy with scripted random EE commands")
     parser.add_argument("--ee_compliance_eval", "--ee-compliance-eval", action="store_true", default=False,
                         help="Evaluate EE compliance with deterministic EE force sweeps")
+    parser.add_argument(
+        "--ee_bimanual_compliance_eval",
+        "--ee-bimanual-compliance-eval",
+        action="store_true",
+        default=False,
+        help="Evaluate both EEs simultaneously with per-EE stiffness targets",
+    )
     parser.add_argument("--ee_compliance_num_envs", type=int, default=1,
                         help="Number of environments to use for ee_compliance_eval")
     parser.add_argument(
@@ -2376,10 +2780,20 @@ def main():
         default=None,
         help=(
             "Optional EE nominal stiffness for compliance eval. Use one isotropic "
-            "value, or three xyz values. For range-trained high-level policies "
-            "this is both the policy input and compliance reference; omitting it "
-            "keeps the existing cfg/sampler behavior."
+            "value, three xyz values, or in bimanual mode two isotropic / six "
+            "[left xyz, right xyz] values. For range-trained high-level policies "
+            "this is both the policy input and compliance reference. A policy "
+            "configured with net_pull_ee_compliance_stiffness_range is scalar "
+            "range-conditioned and accepts one isotropic value; xyz values "
+            "require an xyz-range config. Omitting it keeps cfg/sampler behavior."
         ),
+    )
+    parser.add_argument(
+        "--ee_compliance_force_deadband",
+        "--ee-compliance-force-deadband",
+        type=float,
+        default=None,
+        help="Override the EE compliance force deadband for a matched evaluation protocol.",
     )
     parser.add_argument("--root_compliance_eval", "--root-compliance-eval", action="store_true", default=False,
                         help="Evaluate root/locomotion compliance with deterministic world-frame force sweeps")
@@ -2399,14 +2813,40 @@ def main():
             "delta_x = force_estimator_b / cfg stiffness to the low-level policy."
         ),
     )
+    parser.add_argument(
+        "--ee_compliance_oracle_force",
+        "--ee-compliance-oracle-force",
+        action="store_true",
+        default=False,
+        help=(
+            "Only with --ee_compliance_eval: use the evaluator's ground-truth applied force and "
+            "send nominal + force_b / cfg stiffness directly to the raw stiff low-level policy. "
+            "This is the oracle-force analytical compliance baseline and is incompatible with "
+            "--ee_compliance_force_estimator_ablation."
+        ),
+    )
     args = parser.parse_args()
 
-    eval_modes = [args.ee_tracking_eval, args.ee_compliance_eval, args.root_compliance_eval]
+    eval_modes = [
+        args.ee_tracking_eval,
+        args.ee_compliance_eval,
+        args.ee_bimanual_compliance_eval,
+        args.root_compliance_eval,
+    ]
     if sum(bool(mode) for mode in eval_modes) > 1:
         print("Error: --ee_tracking_eval, --ee_compliance_eval, and --root_compliance_eval are mutually exclusive.")
         sys.exit(1)
     if args.ee_compliance_force_estimator_ablation and not args.ee_compliance_eval:
         print("Error: --ee_compliance_force_estimator_ablation can only be used with --ee_compliance_eval.")
+        sys.exit(1)
+    if args.ee_compliance_oracle_force and not args.ee_compliance_eval:
+        print("Error: --ee_compliance_oracle_force can only be used with --ee_compliance_eval.")
+        sys.exit(1)
+    if args.ee_compliance_force_estimator_ablation and args.ee_compliance_oracle_force:
+        print(
+            "Error: --ee_compliance_force_estimator_ablation and "
+            "--ee_compliance_oracle_force are mutually exclusive."
+        )
         sys.exit(1)
     policy_sources = [args.run_path, args.checkpoint, args.moe_experts_config]
     if sum(source is not None for source in policy_sources) != 1:
@@ -2475,9 +2915,16 @@ def main():
             cfg["vecnorm"] = "eval"
 
     elif args.checkpoint:
-        # Load from local checkpoint with default config
-        with hydra.initialize(config_path="../cfg", job_name="eval_manipulation", version_base=None):
-            cfg = hydra.compose(config_name="eval", overrides=[])
+        # Load from a local training config when supplied; otherwise retain the
+        # historical default eval config behavior for backwards compatibility.
+        if args.config_file:
+            if not os.path.isfile(args.config_file):
+                print(f"Error: local config file does not exist: {args.config_file}")
+                sys.exit(1)
+            cfg = OmegaConf.load(args.config_file)
+        else:
+            with hydra.initialize(config_path="../cfg", job_name="eval_manipulation", version_base=None):
+                cfg = hydra.compose(config_name="eval", overrides=[])
         OmegaConf.set_struct(cfg, False)
         cfg["checkpoint_path"] = args.checkpoint
         cfg["vecnorm"] = "eval"
@@ -2490,7 +2937,11 @@ def main():
             cfg = hydra.compose(
                 config_name="eval",
                 overrides=[
-                    "task=G1/G1_hl_ee_xyz_analytical_moe_200_600_force_b_student",
+                    (
+                        "task=G1/G1_hl_ee_bimanual_analytical_moe_200_600_force_b_student"
+                        if args.ee_bimanual_compliance_eval
+                        else "task=G1/G1_hl_ee_xyz_analytical_moe_200_600_force_b_student"
+                    ),
                     "+algo=root_student_force_analytical_moe",
                 ],
             )
@@ -2538,12 +2989,20 @@ def main():
         cfg["task"]["command"] = _cfg.task.command
         cfg["task"]["flags"] = _cfg.task.flags
 
-    external_force_mode = "default" if args.ee_compliance_eval else args.external_force
+    external_force_mode = "default" if (args.ee_compliance_eval or args.ee_bimanual_compliance_eval) else args.external_force
     _apply_external_force_mode(cfg, external_force_mode)
+    if args.ee_compliance_force_deadband is not None:
+        command_cfg = cfg["task"].get("command", {})
+        if command_cfg is not None:
+            command_cfg["net_pull_ee_compliance_force_deadband"] = float(args.ee_compliance_force_deadband)
+        print(
+            "EE compliance force deadband override: "
+            f"{float(args.ee_compliance_force_deadband):.3f}"
+        )
 
-    if args.ee_tracking_eval or args.ee_compliance_eval or args.root_compliance_eval:
+    if args.ee_tracking_eval or args.ee_compliance_eval or args.ee_bimanual_compliance_eval or args.root_compliance_eval:
         cfg["app"]["headless"] = not args.play
-        if args.ee_compliance_eval:
+        if args.ee_compliance_eval or args.ee_bimanual_compliance_eval:
             cfg["task"]["num_envs"] = args.ee_compliance_num_envs
         elif args.root_compliance_eval:
             cfg["task"]["num_envs"] = args.root_compliance_num_envs
@@ -2563,7 +3022,7 @@ def main():
             cfg["task"]["command"]["teleop"] = {"enabled": False, "obs_source": "motion"}
 
         fixed_low_level_force_limit = None
-        if args.ee_tracking_eval or args.ee_compliance_eval:
+        if args.ee_tracking_eval or args.ee_compliance_eval or args.ee_bimanual_compliance_eval:
             fixed_low_level_force_limit = _fix_low_level_force_limit_for_ee_eval(cfg)
 
         if "init_noise" in cfg["task"]["command"]:
@@ -2585,12 +3044,18 @@ def main():
             cfg["task"]["objects"] = objects_cfg.get("objects", [])
             print(f"  Objects: Loaded {len(cfg['task']['objects'])} objects from {args.objects}")
 
-        if args.ee_compliance_eval:
+        if args.ee_compliance_eval or args.ee_bimanual_compliance_eval:
             cfg["task"]["objects"] = []
             print("  Objects: cleared for empty compliance eval scene")
         if args.root_compliance_eval:
             cfg["task"]["objects"] = []
             print("  Objects: cleared for empty root compliance eval scene")
+
+    if args.ee_compliance_eval or args.ee_bimanual_compliance_eval:
+        _validate_explicit_eval_stiffness(
+            cfg,
+            getattr(args, "ee_compliance_stiffness", None),
+        )
 
     if args.ee_tracking_eval:
         print("\n" + "="*60)
@@ -2609,6 +3074,17 @@ def main():
         print("="*60 + "\n")
 
         evaluate_ee_tracking(cfg, args)
+
+    elif args.ee_bimanual_compliance_eval:
+        print("\n" + "="*60)
+        print("MANIPULATION TASK (Bimanual EE Compliance Eval)")
+        print("="*60)
+        print(f"  Run: {_policy_source_label(args)}")
+        print(f"  Num envs: {args.ee_compliance_num_envs}")
+        print("  EE bodies: left_hand_mimic,right_hand_mimic")
+        print("  Force mode: same direction and magnitude on both hands")
+        print("="*60 + "\n")
+        evaluate_ee_bimanual_compliance(cfg, args)
 
     elif args.ee_compliance_eval:
         print("\n" + "="*60)
